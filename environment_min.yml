@@ -1,0 +1,7 @@
+name: vla_baseline
+channels:
+  - defaults
+dependencies:
+  - python==3.12.12
+  - ffmpeg=6
+  - pip
