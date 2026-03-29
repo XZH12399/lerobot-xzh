@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
 #
@@ -26,9 +26,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_IMAGE_SIZE = 224
 
 
-@PreTrainedConfig.register_subclass("pi05_memory")
+@PreTrainedConfig.register_subclass("pi05_word")
 @dataclass
-class PI05MemoryConfig(PreTrainedConfig):
+class PI05WordConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
@@ -62,24 +62,6 @@ class PI05MemoryConfig(PreTrainedConfig):
     empty_cameras: int = 0
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
-
-    # History memory baseline settings
-    use_history_memory: bool = True
-    memory_size: int = 16
-    memory_dim: int = 512
-    memory_num_heads: int = 8
-    memory_dropout: float = 0.1
-    memory_fusion: str = "gated"
-    reset_memory_on_new_episode: bool = True
-    use_time_embedding_in_memory: bool = True
-    memory_residual_scale_init: float = 0.0
-    training_history_mode: str = "batch_fifo"
-    use_history_apply_gate: bool = True
-    history_apply_gate_bias_init: float = -2.0
-    memory_retrieval_layers: int = 2
-    memory_consolidate_type: str = "fifo"
-    memory_update_fused: bool = False
-    memory_training_layout: str = "batch_sorted"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -133,33 +115,6 @@ class PI05MemoryConfig(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
-        if self.memory_size <= 0:
-            raise ValueError(f"memory_size must be positive, got {self.memory_size}")
-
-        if self.memory_dim <= 0:
-            raise ValueError(f"memory_dim must be positive, got {self.memory_dim}")
-
-        if self.memory_num_heads <= 0:
-            raise ValueError(f"memory_num_heads must be positive, got {self.memory_num_heads}")
-
-        if self.memory_dropout < 0:
-            raise ValueError(f"memory_dropout must be non-negative, got {self.memory_dropout}")
-
-        if self.memory_fusion not in ["gated", "add"]:
-            raise ValueError(f"Invalid memory_fusion: {self.memory_fusion}")
-
-        if self.training_history_mode not in ["batch_fifo", "legacy_cache"]:
-            raise ValueError(f"Invalid training_history_mode: {self.training_history_mode}")
-
-        if self.memory_retrieval_layers <= 0:
-            raise ValueError(f"memory_retrieval_layers must be positive, got {self.memory_retrieval_layers}")
-
-        if self.memory_consolidate_type not in ["fifo", "tome"]:
-            raise ValueError(f"Invalid memory_consolidate_type: {self.memory_consolidate_type}")
-
-        if self.memory_training_layout not in ["batch_sorted", "stream"]:
-            raise ValueError(f"Invalid memory_training_layout: {self.memory_training_layout}")
-
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
         for i in range(self.empty_cameras):
@@ -212,3 +167,5 @@ class PI05MemoryConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+

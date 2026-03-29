@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+CONDA_SH="${CONDA_SH:-$HOME/.conda/etc/profile.d/conda.sh}"
 ENV_NAME="${ENV_NAME:-vla_baseline}"
-PROJECT_DIR="${PROJECT_DIR:-$HOME/projects/lerobot}"
+PROJECT_DIR="${PROJECT_DIR:-$HOME/XZH/project/lerobot-xzh}"
 
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 MUJOCO_GL="${MUJOCO_GL:-egl}"
+PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-$MUJOCO_GL}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 PYTHONPATH_EXTRA="${PYTHONPATH_EXTRA:-$HOME/.codex_runtime}"
@@ -14,7 +15,7 @@ PYTHONPATH_EXTRA="${PYTHONPATH_EXTRA:-$HOME/.codex_runtime}"
 HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
 HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}"
 
-POLICY_PATH="${POLICY_PATH:-$HOME/.cache/huggingface/hub/models--lerobot--pi05_libero_base/snapshots/a217bfd3b14673cf2ce597e69997ab21866438dd}"
+POLICY_PATH="${POLICY_PATH:-lerobot/pi05_libero_base}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-HuggingFaceVLA/libero}"
 DATASET_ROOT="${DATASET_ROOT:-/mnt/sda/xzh/huggingface/lerobot/HuggingFaceVLA/libero}"
 ENV_TASK="${ENV_TASK:-libero_10}"
@@ -55,10 +56,14 @@ conda activate "$ENV_NAME"
 
 export HF_ENDPOINT
 export MUJOCO_GL
+export PYOPENGL_PLATFORM
 export CUDA_VISIBLE_DEVICES
 export PYTORCH_CUDA_ALLOC_CONF
+if [[ -n "${CONDA_PREFIX:-}" && -d "$CONDA_PREFIX/lib" ]]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+fi
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="$PYTHONPATH_EXTRA:${PYTHONPATH:-}"
+export PYTHONPATH="$PROJECT_DIR/src:$PYTHONPATH_EXTRA:${PYTHONPATH:-}"
 
 if [[ -z "$HF_TOKEN" && -f "$HF_TOKEN_FILE" ]]; then
   HF_TOKEN="$(tr -d ' 	
@@ -74,7 +79,7 @@ else
 fi
 
 CMD=(
-  lerobot-train
+  python -m lerobot.scripts.lerobot_train
   --policy.path="$POLICY_PATH"
   --policy.push_to_hub="$PUSH_TO_HUB"
   --dataset.repo_id="$DATASET_REPO_ID"
@@ -108,6 +113,7 @@ echo "[INFO] project: $PROJECT_DIR"
 echo "[INFO] env: $ENV_NAME"
 echo "[INFO] HF_ENDPOINT: $HF_ENDPOINT"
 echo "[INFO] MUJOCO_GL: $MUJOCO_GL"
+echo "[INFO] PYOPENGL_PLATFORM: $PYOPENGL_PLATFORM"
 echo "[INFO] CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "[INFO] PYTORCH_CUDA_ALLOC_CONF: $PYTORCH_CUDA_ALLOC_CONF"
 echo "[INFO] policy.path: $POLICY_PATH"

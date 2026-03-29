@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from numbers import Real
 from pprint import pformat
 from typing import Any
 
@@ -54,6 +55,45 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _coerce_scalar_metric_value(value: Any) -> float | None:
+    """Convert scalar-like values to float so they can be tracked in local train logs."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().item())
+
+    if isinstance(value, Real) and not isinstance(value, bool):
+        return float(value)
+
+    return None
+
+
+def _register_output_metrics(
+    train_metrics: MetricsTracker, output_dict: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Merge scalar entries from policy outputs into tracked metrics and return non-scalars."""
+    if not output_dict:
+        return {}
+
+    passthrough: dict[str, Any] = {}
+    for key, value in output_dict.items():
+        if key == "loss":
+            continue
+
+        scalar_value = _coerce_scalar_metric_value(value)
+        if scalar_value is None:
+            passthrough[key] = value
+            continue
+
+        if key not in train_metrics.metrics:
+            use_scientific = abs(scalar_value) >= 1e4 or (0 < abs(scalar_value) < 1e-3)
+            train_metrics.metrics[key] = AverageMeter(key, ":0.1e" if use_scientific else ":.3f")
+
+        setattr(train_metrics, key, scalar_value)
+
+    return passthrough
 
 
 def update_policy(
@@ -424,6 +464,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
         )
+        non_scalar_output_dict = _register_output_metrics(train_tracker, output_dict)
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -439,8 +480,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             logging.info(train_tracker)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
+                if non_scalar_output_dict:
+                    wandb_log_dict.update(non_scalar_output_dict)
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()

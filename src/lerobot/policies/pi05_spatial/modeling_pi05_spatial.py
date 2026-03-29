@@ -18,9 +18,9 @@ import builtins
 import copy
 import logging
 import math
-from collections import defaultdict, deque
+from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -47,13 +47,14 @@ else:
     layernorm_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.pi05_memory.configuration_pi05_memory import DEFAULT_IMAGE_SIZE, PI05MemoryConfig
+from lerobot.policies.pi05_spatial.configuration_pi05_spatial import DEFAULT_IMAGE_SIZE, PI05SpatialConfig
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -62,35 +63,6 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
-
-
-class TimestepEmbedder(nn.Module):
-    """MemoryVLA-style timestep embedding."""
-
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t: Tensor, dim: int, max_period: int = 10000) -> Tensor:
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t: Tensor) -> Tensor:
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(next(self.mlp.parameters()).dtype)
-        return self.mlp(t_freq)
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -177,336 +149,26 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
-class HistoryMemoryEncoder(nn.Module):
-    """Compresses the current hidden state into a history memory token."""
-
-    def __init__(self, input_dim: int, memory_dim: int):
-        super().__init__()
-        self.proj = nn.Linear(input_dim, memory_dim)
-        self.norm = nn.LayerNorm(memory_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.norm(self.proj(x))
-
-
-class HistoryRetriever(nn.Module):
-    """Retrieves a summary vector from the explicit history memory tokens."""
-
-    def __init__(self, query_dim: int, memory_dim: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.query_proj = nn.Linear(query_dim, memory_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=memory_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
+def slice_action_trajectory(actions: Tensor, start_index: int, trajectory_dim: int) -> Tensor:
+    """Extract the trajectory-related action subspace used for fallback supervision."""
+    end_index = start_index + trajectory_dim
+    if actions.shape[-1] < end_index:
+        raise ValueError(
+            f"Cannot slice trajectory dims [{start_index}:{end_index}] from actions with shape {tuple(actions.shape)}"
         )
-        self.norm = nn.LayerNorm(memory_dim)
+    return actions[..., start_index:end_index]
 
-    def forward(
-        self,
-        query: Tensor,
-        memory_tokens: Tensor,
-        memory_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        q = self.query_proj(query)
-        out, attn = self.attn(
-            q,
-            memory_tokens,
-            memory_tokens,
-            key_padding_mask=memory_mask,
-            need_weights=True,
+
+def integrate_delta_trajectory(current_eef_pos: Tensor, delta_actions: Tensor) -> Tensor:
+    """Approximate a future trajectory by integrating relative action deltas from the current EE position."""
+    if current_eef_pos.dim() != 2:
+        raise ValueError(
+            f"current_eef_pos must have shape (B, D), got shape {tuple(current_eef_pos.shape)}"
         )
-        return self.norm(out), attn
-
-
-class GatedMemoryFusion(nn.Module):
-    """Fuses the current hidden state with retrieved history information."""
-
-    def __init__(self, hidden_dim: int, memory_dim: int):
-        super().__init__()
-        self.memory_to_hidden = nn.Linear(memory_dim, hidden_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-
-        # Start close to the pretrained pi05 behavior and let history influence grow gradually.
-        final_linear = self.gate[-1]
-        nn.init.zeros_(final_linear.weight)
-        nn.init.constant_(final_linear.bias, -2.0)
-
-    def forward(self, current_state: Tensor, history_summary: Tensor) -> Tensor:
-        history_hidden = self.memory_to_hidden(history_summary)
-        gate = torch.sigmoid(self.gate(torch.cat([current_state, history_hidden], dim=-1)))
-        fused = gate * history_hidden + (1.0 - gate) * current_state
-        return self.norm(fused)
-
-
-class HistoryApplyGate(nn.Module):
-    """Predicts when retrieved history should influence the current step."""
-
-    def __init__(self, hidden_dim: int, bias_init: float):
-        super().__init__()
-        inner_dim = max(hidden_dim // 2, 1)
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, inner_dim),
-            nn.GELU(),
-            nn.Linear(inner_dim, 1),
-        )
-        final_linear = self.net[-1]
-        nn.init.zeros_(final_linear.weight)
-        nn.init.constant_(final_linear.bias, bias_init)
-
-    def forward(self, current_state: Tensor, history_hidden: Tensor) -> Tensor:
-        gate_logits = self.net(torch.cat([current_state, history_hidden], dim=-1))
-        return torch.sigmoid(gate_logits)
-
-
-class CrossTransformerBlock(nn.Module):
-    """MemoryVLA-style retrieval block over token sequences."""
-
-    def __init__(self, feature_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(feature_dim, feature_dim)
-        self.k_proj = nn.Linear(feature_dim, feature_dim)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.attn_norm = nn.LayerNorm(feature_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * 4),
-            nn.GELU(),
-            nn.Linear(feature_dim * 4, feature_dim),
-        )
-        self.ffn_norm = nn.LayerNorm(feature_dim)
-
-    def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        orig_dtype = query.dtype
-        proj_dtype = self.q_proj.weight.dtype
-
-        query_in = query.to(dtype=proj_dtype)
-        key_in = key.to(dtype=proj_dtype)
-        value_in = value.to(dtype=proj_dtype)
-
-        q = self.q_proj(query_in)
-        k = self.k_proj(key_in)
-        v = self.v_proj(value_in)
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        x = self.attn_norm(query_in + attn_out)
-        ffn_out = self.ffn(x)
-        return self.ffn_norm(x + ffn_out).to(dtype=orig_dtype)
-
-
-class SequenceGateFusion(nn.Module):
-    """MemoryVLA-style tokenwise gate fusion."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.proj = nn.Linear(dim * 2, dim)
-        nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.proj.bias, mean=0.0, std=1e-3)
-
-    def forward(self, current_tokens: Tensor, retrieved_tokens: Tensor) -> Tensor:
-        orig_dtype = current_tokens.dtype
-        proj_dtype = self.proj.weight.dtype
-        fused_input = torch.cat([current_tokens, retrieved_tokens], dim=-1).to(dtype=proj_dtype)
-        scale = torch.sigmoid(self.proj(fused_input)).to(dtype=orig_dtype)
-        return scale * current_tokens + (1.0 - scale) * retrieved_tokens
-
-
-class PI05MemoryBank(nn.Module):
-    """MemoryVLA-style episodic bank adapted for pi05 prefix tokens."""
-
-    def __init__(
-        self,
-        token_size: int,
-        mem_length: int,
-        retrieval_layers: int,
-        use_timestep_pe: bool,
-        fusion_type: str,
-        consolidate_type: str,
-        update_fused: bool,
-    ):
-        super().__init__()
-        self.token_size = token_size
-        self.mem_length = mem_length
-        self.retrieval_layers = retrieval_layers
-        self.use_timestep_pe = use_timestep_pe
-        self.fusion_type = fusion_type
-        self.consolidate_type = consolidate_type
-        self.update_fused = update_fused
-
-        self.retrieval_blocks = nn.ModuleList(
-            [CrossTransformerBlock(self.token_size) for _ in range(self.retrieval_layers)]
-        )
-        self.gate_fusion = SequenceGateFusion(self.token_size) if self.fusion_type == "gated" else None
-        self.timestep_encoder = (
-            TimestepEmbedder(self.token_size, frequency_embedding_size=max(self.token_size // 4, 1))
-            if self.use_timestep_pe
-            else None
-        )
-        self.reset()
-
-    def reset(self):
-        self.bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-
-    def clear_episode(self, episode_id: int):
-        self.bank.pop(int(episode_id), None)
-
-    @torch.no_grad()
-    def _consolidate_with_token_merge(self, episode_id: int):
-        bank = self.bank.get(int(episode_id), [])
-        if len(bank) < 2:
-            return
-
-        feats = [feat for _, feat in bank]
-        sims = []
-        for i in range(len(feats) - 1):
-            feat_i = feats[i].reshape(-1, feats[i].shape[-1])
-            feat_j = feats[i + 1].reshape(-1, feats[i + 1].shape[-1])
-            sims.append(F.cosine_similarity(feat_i, feat_j, dim=-1).mean().item())
-
-        idx_max = int(torch.tensor(sims).argmax().item())
-        timestep_i, feat_i = bank[idx_max]
-        _, feat_j = bank[idx_max + 1]
-        fused_feat = 0.5 * (feat_i + feat_j)
-        bank[idx_max] = (timestep_i, fused_feat.detach().clone())
-        bank.pop(idx_max + 1)
-
-    @torch.no_grad()
-    def _memory_consolidate(self, episode_id: int, feat: Tensor, timestep: int | None):
-        episode_key = int(episode_id)
-        if episode_key not in self.bank:
-            self.bank[episode_key] = []
-
-        self.bank[episode_key].append((timestep, feat.detach().clone()))
-        while len(self.bank[episode_key]) > self.mem_length:
-            if self.consolidate_type == "fifo":
-                self.bank[episode_key] = self.bank[episode_key][-self.mem_length :]
-            elif self.consolidate_type == "tome":
-                self._consolidate_with_token_merge(episode_key)
-            else:
-                raise NotImplementedError(f"Unsupported consolidate_type: {self.consolidate_type}")
-
-    def _build_time_pe(self, hist_timesteps: list[int | None], token_count: int, device: torch.device, dtype: torch.dtype):
-        if self.timestep_encoder is None:
-            return None
-
-        valid_timesteps = [0 if t is None else int(t) for t in hist_timesteps]
-        timestep_tensor = torch.tensor(valid_timesteps, device=device, dtype=torch.float32)
-        pe = self.timestep_encoder(timestep_tensor).unsqueeze(0).to(dtype=dtype)
-        return pe.repeat_interleave(token_count, dim=1)
-
-    def _retrieve_from_bank(self, working_mem: Tensor, hist: list[tuple[int | None, Tensor]]) -> Tensor:
-        if len(hist) == 0:
-            return working_mem
-
-        _, token_count, token_dim = working_mem.shape
-        hist_feats = [feat.to(device=working_mem.device, dtype=working_mem.dtype) for _, feat in hist]
-        episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, token_dim).unsqueeze(0)
-        pe = self._build_time_pe([t for t, _ in hist], token_count, working_mem.device, working_mem.dtype)
-        if pe is None:
-            pe = torch.zeros_like(episode_mem)
-
-        query = working_mem
-        for block in self.retrieval_blocks:
-            query = block(query, episode_mem + pe, episode_mem)
-        return query
-
-    def _fuse_tokens(self, working_mem: Tensor, retrieved_mem: Tensor) -> Tensor:
-        if self.fusion_type == "add":
-            return 0.5 * (working_mem + retrieved_mem)
-        return self.gate_fusion(working_mem, retrieved_mem)
-
-    def _process_ordered_tokens(
-        self,
-        tokens: Tensor,
-        episode_ids: list[int],
-        timesteps: list[int | None],
-        bank_override: dict[int, list[tuple[int | None, Tensor]]] | None = None,
-    ) -> Tensor:
-        active_bank = self.bank if bank_override is None else bank_override
-        outputs = []
-        for i in range(tokens.shape[0]):
-            eid = int(episode_ids[i])
-            working_mem = tokens[i].unsqueeze(0)
-            hist = active_bank.get(eid, [])
-            retrieved_mem = self._retrieve_from_bank(working_mem, hist)
-            fused_feats = self._fuse_tokens(working_mem, retrieved_mem)
-            outputs.append(fused_feats)
-
-            timestep_i = timesteps[i] if self.use_timestep_pe else None
-            episode_bank = active_bank.setdefault(eid, [])
-            episode_bank.append(
-                (
-                    timestep_i,
-                    (fused_feats if self.update_fused else working_mem).squeeze(0).detach().clone(),
-                )
-            )
-            while len(episode_bank) > self.mem_length:
-                if self.consolidate_type == "fifo":
-                    del episode_bank[:-self.mem_length]
-                elif self.consolidate_type == "tome":
-                    if bank_override is None:
-                        self._consolidate_with_token_merge(eid)
-                    else:
-                        temp_bank = self.bank
-                        self.bank = active_bank
-                        self._consolidate_with_token_merge(eid)
-                        self.bank = temp_bank
-                else:
-                    raise NotImplementedError(f"Unsupported consolidate_type: {self.consolidate_type}")
-
-        return torch.cat(outputs, dim=0)
-
-    def process_training_batch(
-        self,
-        tokens: Tensor,
-        episode_ids: Tensor | None,
-        timesteps: Tensor | None,
-        training_layout: str,
-    ) -> Tensor:
-        if episode_ids is None:
-            return tokens
-
-        batch_size = tokens.shape[0]
-        episode_list = episode_ids.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        if timesteps is not None:
-            timestep_list = timesteps.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        else:
-            timestep_list = list(range(batch_size))
-
-        if training_layout == "stream":
-            temp_bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-            return self._process_ordered_tokens(tokens, episode_list, timestep_list, bank_override=temp_bank)
-
-        sorted_indices = sorted(
-            range(batch_size),
-            key=lambda idx: (int(episode_list[idx]), int(timestep_list[idx]), idx),
-        )
-        ordered_tokens = tokens[sorted_indices]
-        ordered_episode_ids = [int(episode_list[idx]) for idx in sorted_indices]
-        ordered_timesteps = [int(timestep_list[idx]) for idx in sorted_indices]
-        temp_bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-        ordered_outputs = self._process_ordered_tokens(
-            ordered_tokens,
-            ordered_episode_ids,
-            ordered_timesteps,
-            bank_override=temp_bank,
-        )
-        restored_outputs = torch.empty_like(ordered_outputs)
-        for ordered_idx, original_idx in enumerate(sorted_indices):
-            restored_outputs[original_idx] = ordered_outputs[ordered_idx]
-        return restored_outputs
-
-    def process_runtime_batch(
-        self,
-        tokens: Tensor,
-        episode_ids: list[int],
-        timesteps: list[int | None],
-    ) -> Tensor:
-        return self._process_ordered_tokens(tokens, episode_ids, timesteps)
+    if delta_actions.dim() != 3:
+        raise ValueError(f"delta_actions must have shape (B, T, D), got shape {tuple(delta_actions.shape)}")
+    cumulative_delta = torch.cumsum(delta_actions, dim=1)
+    return current_eef_pos[:, None, :] + cumulative_delta
 
 
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
@@ -696,7 +358,7 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
-    """PaliGemma model with action expert for PI05."""
+    """PaliGemma model with action expert for PI05Spatial."""
 
     def __init__(
         self,
@@ -908,10 +570,290 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
-    """Core PI05 PyTorch model."""
+class SpatialFeatureExtractor(nn.Module):
+    """Lightweight multi-scale CNN used for geometry-aware local sampling."""
 
-    def __init__(self, config: PI05MemoryConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, feature_dims: tuple[int, int, int]):
+        super().__init__()
+        c1, c2, c3 = feature_dims
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(3, c1, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.GroupNorm(self._group_count(c1), c1),
+            nn.SiLU(),
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(self._group_count(c1), c1),
+            nn.SiLU(),
+        )
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(self._group_count(c2), c2),
+            nn.SiLU(),
+            nn.Conv2d(c2, c2, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(self._group_count(c2), c2),
+            nn.SiLU(),
+        )
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(self._group_count(c3), c3),
+            nn.SiLU(),
+            nn.Conv2d(c3, c3, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(self._group_count(c3), c3),
+            nn.SiLU(),
+        )
+
+    @staticmethod
+    def _group_count(num_channels: int) -> int:
+        for group_count in range(min(8, num_channels), 0, -1):
+            if num_channels % group_count == 0:
+                return group_count
+        return 1
+
+    def forward(self, image: Tensor) -> list[Tensor]:
+        high = self.stage1(image)
+        mid = self.stage2(high)
+        low = self.stage3(mid)
+        return [low, mid, high]
+
+
+class Trajectory3DTokenizer(nn.Module):
+    """Builds trajectory tokens from explicit 3D points plus state/time context."""
+
+    def __init__(
+        self,
+        trajectory_dim: int,
+        model_dim: int,
+        hidden_dim: int,
+        num_fourier_bands: int,
+    ):
+        super().__init__()
+        self.trajectory_dim = trajectory_dim
+        self.num_fourier_bands = num_fourier_bands
+        coord_input_dim = trajectory_dim * num_fourier_bands * 2
+        self.coord_proj = nn.Sequential(
+            nn.Linear(coord_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+        self.token_fuse = nn.Sequential(
+            nn.Linear(model_dim * 4, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+        self.residual_gate = nn.Parameter(torch.zeros(1))
+
+    def fourier_encode(self, trajectory_xyz: Tensor) -> Tensor:
+        freq_bands = torch.pow(
+            trajectory_xyz.new_tensor(2.0),
+            torch.arange(self.num_fourier_bands, device=trajectory_xyz.device, dtype=trajectory_xyz.dtype),
+        )
+        scaled = trajectory_xyz.unsqueeze(-1) * freq_bands * math.pi
+        return torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1).flatten(start_dim=-2)
+
+    def forward(
+        self,
+        trajectory_emb: Tensor,
+        state_emb: Tensor,
+        time_emb: Tensor,
+        trajectory_xyz: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        coord_emb = self.coord_proj(self.fourier_encode(trajectory_xyz))
+        state_ctx = state_emb[:, None, :].expand(-1, trajectory_emb.shape[1], -1)
+        time_ctx = time_emb[:, None, :].expand_as(state_ctx)
+        token_delta = self.token_fuse(torch.cat([trajectory_emb, coord_emb, state_ctx, time_ctx], dim=-1))
+        tokens = trajectory_emb + self.residual_gate * token_delta
+        return tokens, coord_emb
+
+
+class ProjectAndSample(nn.Module):
+    """Projects 3D points to an image plane and samples anchor-centered local windows."""
+
+    def __init__(
+        self,
+        image_resolution: tuple[int, int],
+        projection_fallback_scale: float,
+        local_window_radius: int = 0,
+        local_window_sigma: float = 1.0,
+    ):
+        super().__init__()
+        self.image_resolution = image_resolution
+        self.projection_fallback_scale = projection_fallback_scale
+        self.local_window_radius = local_window_radius
+        self.local_window_sigma = local_window_sigma
+
+    def _apply_transform(self, points: Tensor, transform: Tensor | None) -> Tensor:
+        if transform is None:
+            return points
+        ones = torch.ones(*points.shape[:-1], 1, dtype=points.dtype, device=points.device)
+        points_h = torch.cat([points, ones], dim=-1)
+        transformed = torch.matmul(transform[:, None, :, :], points_h.unsqueeze(-1)).squeeze(-1)
+        return transformed[..., :3]
+
+    def project_points(
+        self,
+        points: Tensor,
+        intrinsics: Tensor | None = None,
+        transform: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        points_cam = self._apply_transform(points, transform)
+        z = points_cam[..., 2].clamp_min(1e-4)
+
+        if intrinsics is not None:
+            fx = intrinsics[:, 0, 0][:, None]
+            fy = intrinsics[:, 1, 1][:, None]
+            cx = intrinsics[:, 0, 2][:, None]
+            cy = intrinsics[:, 1, 2][:, None]
+            u = fx * (points_cam[..., 0] / z) + cx
+            v = fy * (points_cam[..., 1] / z) + cy
+            width = max(self.image_resolution[1] - 1, 1)
+            height = max(self.image_resolution[0] - 1, 1)
+            grid_x = 2.0 * (u / width) - 1.0
+            grid_y = 2.0 * (v / height) - 1.0
+        else:
+            denom = points_cam[..., 2].abs().clamp_min(self.projection_fallback_scale)
+            grid_x = torch.tanh(points_cam[..., 0] / denom)
+            grid_y = torch.tanh(points_cam[..., 1] / denom)
+
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+        valid = (z > 1e-4) & (grid.abs() <= 1.0).all(dim=-1)
+        return grid, valid
+
+    def _sample_local_window(self, feature_map: Tensor, grid: Tensor) -> Tensor:
+        base_grid = grid.to(dtype=feature_map.dtype)
+        if self.local_window_radius <= 0:
+            sampled = F.grid_sample(
+                feature_map,
+                base_grid.unsqueeze(2),
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            return sampled.squeeze(-1).transpose(1, 2)
+
+        height = max(feature_map.shape[-2], 1)
+        width = max(feature_map.shape[-1], 1)
+        step_x = 2.0 / max(width - 1, 1)
+        step_y = 2.0 / max(height - 1, 1)
+        sigma_sq = max(self.local_window_sigma, 1e-6) ** 2
+
+        offsets = []
+        weights = []
+        for delta_y in range(-self.local_window_radius, self.local_window_radius + 1):
+            for delta_x in range(-self.local_window_radius, self.local_window_radius + 1):
+                offsets.append((delta_x * step_x, delta_y * step_y))
+                weights.append(math.exp(-((delta_x**2 + delta_y**2) / (2.0 * sigma_sq))))
+
+        offsets_t = base_grid.new_tensor(offsets).view(1, 1, -1, 2)
+        weights_t = feature_map.new_tensor(weights).view(1, 1, -1)
+        local_grid = base_grid.unsqueeze(2) + offsets_t
+        sampled = F.grid_sample(
+            feature_map,
+            local_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        valid_window = (local_grid.abs() <= 1.0).all(dim=-1)
+        weights_t = weights_t * valid_window.to(dtype=weights_t.dtype)
+        weights_sum = weights_t.sum(dim=-1).clamp_min(1e-6)
+        pooled = (sampled * weights_t[:, None, :, :]).sum(dim=-1) / weights_sum[:, None, :]
+        return pooled.transpose(1, 2)
+
+    def forward(
+        self,
+        points: Tensor,
+        feature_maps: list[Tensor],
+        intrinsics: Tensor | None = None,
+        transform: Tensor | None = None,
+        image_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        grid, valid = self.project_points(points, intrinsics=intrinsics, transform=transform)
+        sampled_features = []
+        for feature_map in feature_maps:
+            sampled_features.append(self._sample_local_window(feature_map, grid))
+
+        sampled = torch.cat(sampled_features, dim=-1)
+        sampled = sampled * valid[:, :, None].to(dtype=sampled.dtype)
+        if image_mask is not None:
+            sampled = sampled * image_mask[:, None, None].to(dtype=sampled.dtype)
+        return sampled, grid, valid
+
+
+class GeometryRefinementBlock(nn.Module):
+    """Injects local dual-view geometry evidence into trajectory tokens."""
+
+    def __init__(
+        self,
+        model_dim: int,
+        sampled_feature_dim: int,
+        hidden_dim: int,
+        trajectory_dim: int,
+        hidden_residual_scale: float,
+        coord_delta_scale: float,
+    ):
+        super().__init__()
+        geom_input_dim = model_dim + 2 * sampled_feature_dim + 2 * model_dim
+        self.geometry_proj = nn.Sequential(
+            nn.Linear(geom_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+        self.token_refine = nn.Sequential(
+            nn.Linear(model_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+        self.delta_head = nn.Sequential(
+            nn.Linear(model_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, trajectory_dim),
+        )
+        self.hidden_residual_scale = hidden_residual_scale
+        self.coord_delta_scale = coord_delta_scale
+
+    def forward(
+        self,
+        trajectory_tokens: Tensor,
+        coord_emb: Tensor,
+        sampled_main: Tensor,
+        sampled_aux: Tensor,
+        state_emb: Tensor,
+        time_emb: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        state_ctx = state_emb[:, None, :].expand(-1, trajectory_tokens.shape[1], -1)
+        time_ctx = time_emb[:, None, :].expand_as(state_ctx)
+        geometry_inputs = torch.cat([coord_emb, sampled_main, sampled_aux, state_ctx, time_ctx], dim=-1)
+        geom_emb = self.geometry_proj(geometry_inputs)
+        token_delta = self.token_refine(torch.cat([trajectory_tokens, geom_emb], dim=-1))
+        hidden_delta = self.hidden_residual_scale * token_delta
+        refined_tokens = trajectory_tokens + hidden_delta
+        delta_xyz = self.coord_delta_scale * self.delta_head(geom_emb)
+        return refined_tokens, delta_xyz, hidden_delta
+
+
+class TrajectoryToActionDecoder(nn.Module):
+    """Maps a denoised 3D trajectory back to the original action space."""
+
+    def __init__(self, trajectory_dim: int, state_dim: int, action_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(trajectory_dim + state_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        # Keep the decoder active from step 0 so gradients reach its MLP immediately.
+        self.residual_gate = nn.Parameter(torch.ones(1))
+
+    def forward(self, trajectory_xyz: Tensor, state: Tensor) -> Tensor:
+        state_ctx = state[:, None, :].expand(-1, trajectory_xyz.shape[1], -1)
+        return self.residual_gate * self.net(torch.cat([trajectory_xyz, state_ctx], dim=-1))
+
+
+class PI05SpatialPytorch(nn.Module):  # see openpi `PI0Pytorch`
+    """Core PI05Spatial PyTorch model."""
+
+    def __init__(self, config: PI05SpatialConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
@@ -936,47 +878,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
-
-        # MemoryVLA-style explicit history memory modules.
-        prefix_hidden_dim = paligemma_config.width
-        self.history_mem_bank = PI05MemoryBank(
-            token_size=prefix_hidden_dim,
-            mem_length=config.memory_size,
-            retrieval_layers=config.memory_retrieval_layers,
-            use_timestep_pe=config.use_time_embedding_in_memory,
-            fusion_type=config.memory_fusion,
-            consolidate_type=config.memory_consolidate_type,
-            update_fused=config.memory_update_fused,
+        self.spatial_feature_extractor = SpatialFeatureExtractor(config.spatial_feature_dims)
+        self.trajectory_tokenizer = Trajectory3DTokenizer(
+            trajectory_dim=config.trajectory_dim,
+            model_dim=action_expert_config.width,
+            hidden_dim=config.geometry_hidden_dim,
+            num_fourier_bands=config.geometry_num_fourier_bands,
         )
-        # Kept for backward compatibility with older pi05_memory checkpoints.
-        self.history_memory_encoder = HistoryMemoryEncoder(
-            input_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
+        self.project_and_sample = ProjectAndSample(
+            image_resolution=config.image_resolution,
+            projection_fallback_scale=config.projection_fallback_scale,
+            local_window_radius=config.geometry_local_window_radius,
+            local_window_sigma=config.geometry_local_window_sigma,
         )
-        self.history_retriever = HistoryRetriever(
-            query_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
-            num_heads=config.memory_num_heads,
-            dropout=config.memory_dropout,
+        self.geometry_refinement = GeometryRefinementBlock(
+            model_dim=action_expert_config.width,
+            sampled_feature_dim=sum(config.spatial_feature_dims),
+            hidden_dim=config.geometry_hidden_dim,
+            trajectory_dim=config.trajectory_dim,
+            hidden_residual_scale=config.geometry_hidden_residual_scale,
+            coord_delta_scale=config.geometry_coord_delta_scale,
         )
-        self.gated_memory_fusion = GatedMemoryFusion(
-            hidden_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
+        self.trajectory_decoder = TrajectoryToActionDecoder(
+            trajectory_dim=config.trajectory_dim,
+            state_dim=config.max_state_dim,
+            action_dim=config.max_action_dim,
+            hidden_dim=config.trajectory_decoder_hidden_dim,
         )
-
-        history_module_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
-        self.history_mem_bank.to(dtype=history_module_dtype)
-        self.history_memory_encoder.to(dtype=history_module_dtype)
-        self.history_retriever.to(dtype=history_module_dtype)
-        self.gated_memory_fusion.to(dtype=history_module_dtype)
-
-        # A global residual scale keeps the model close to vanilla pi05 at init
-        # and lets history influence grow only when the optimization supports it.
-        self.history_residual_scale = nn.Parameter(torch.tensor(config.memory_residual_scale_init, dtype=torch.float32))
-        self.reset_history_memory()
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -994,7 +926,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-        logging.info("Enabled gradient checkpointing for PI05Pytorch model")
+        logging.info("Enabled gradient checkpointing for PI05SpatialPytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
@@ -1002,259 +934,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-        logging.info("Disabled gradient checkpointing for PI05Pytorch model")
-
-    def reset_history_memory(self):
-        """Reset the explicit history memory used during training and online inference."""
-        self.runtime_episode_id = None
-        self.runtime_frame_index = 0
-        self.runtime_memory_tokens = []
-        self.training_history_cache = {}
-        self.history_mem_bank.reset()
-
-    def _update_training_history_cache(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> None:
-        # Legacy helper retained for backward compatibility. The active training
-        # path now routes through `self.history_mem_bank`.
-        return
-
-    def _get_runtime_history(self, batch_size: int, device: torch.device) -> tuple[Tensor | None, Tensor | None]:
-        # Legacy helper retained for backward compatibility. The active inference
-        # path now routes through `self.history_mem_bank`.
-        history_tokens = None
-        memory_mask = None
-        return history_tokens, memory_mask
-
-    def _update_runtime_history(self, current_memory_token: Tensor):
-        # Legacy helper retained for backward compatibility. Runtime updates now
-        # happen inside `self.history_mem_bank.process_runtime_batch`.
-        return
-
-    def _summarize_hidden_states(self, hidden_states: Tensor, pad_masks: Tensor) -> Tensor:
-        weights = pad_masks.to(dtype=hidden_states.dtype).unsqueeze(-1)
-        denom = weights.sum(dim=1).clamp_min(1.0)
-        return (hidden_states * weights).sum(dim=1) / denom
-
-    def _build_training_history_from_batch(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Legacy interface retained while migration moves to MemoryVLA-style banks."""
-        return None, None
-
-    def _build_training_history_from_batch_fifo(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Simulate the inference-time FIFO using only the current batch.
-
-        This avoids mixing in stale memory tokens produced by older model weights,
-        which happens when a cache survives parameter updates across many batches.
-        """
-        if episode_indices is None or frame_indices is None:
-            return None, None
-
-        batch_size, memory_dim = current_memory_tokens.shape
-        if batch_size == 0:
-            return None, None
-
-        episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        frame_ids = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-
-        history_tokens = torch.zeros(
-            batch_size,
-            self.config.memory_size,
-            memory_dim,
-            device=current_memory_tokens.device,
-            dtype=current_memory_tokens.dtype,
-        )
-        history_mask = torch.ones(
-            batch_size,
-            self.config.memory_size,
-            device=current_memory_tokens.device,
-            dtype=torch.bool,
-        )
-
-        source_tokens = current_memory_tokens.detach()
-        episode_to_frame_rows: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
-        for row_idx, (episode_id, frame_id) in enumerate(zip(episode_ids, frame_ids, strict=True)):
-            episode_to_frame_rows[int(episode_id)][int(frame_id)].append(row_idx)
-
-        for frame_rows in episode_to_frame_rows.values():
-            fifo_tokens: deque[Tensor] = deque(maxlen=self.config.memory_size)
-            for _, row_indices in sorted(frame_rows.items()):
-                if fifo_tokens:
-                    selected_tokens = torch.stack(list(fifo_tokens), dim=0)
-                    selected_tokens = selected_tokens.to(
-                        device=current_memory_tokens.device,
-                        dtype=current_memory_tokens.dtype,
-                    )
-                    history_len = selected_tokens.shape[0]
-                    for row_idx in row_indices:
-                        history_tokens[row_idx, :history_len] = selected_tokens
-                        history_mask[row_idx, :history_len] = False
-
-                frame_token = source_tokens[row_indices].mean(dim=0)
-                fifo_tokens.append(frame_token)
-
-        return history_tokens, history_mask
-
-    def _build_training_history_from_cache(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Legacy history builder kept for ablations and backward comparison."""
-        if episode_indices is None or frame_indices is None:
-            return None, None
-
-        batch_size, memory_dim = current_memory_tokens.shape
-        if batch_size == 0:
-            return None, None
-
-        episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        frame_ids = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-
-        history_tokens = torch.zeros(
-            batch_size,
-            self.config.memory_size,
-            memory_dim,
-            device=current_memory_tokens.device,
-            dtype=current_memory_tokens.dtype,
-        )
-        history_mask = torch.ones(
-            batch_size,
-            self.config.memory_size,
-            device=current_memory_tokens.device,
-            dtype=torch.bool,
-        )
-
-        source_tokens = current_memory_tokens.detach()
-        for i in range(batch_size):
-            episode_key = int(episode_ids[i])
-            frame_key = int(frame_ids[i])
-            candidate_tokens_by_frame: dict[int, Tensor] = {}
-
-            for cached_frame, cached_token in self.training_history_cache.get(episode_key, []):
-                if cached_frame < frame_key:
-                    candidate_tokens_by_frame[int(cached_frame)] = cached_token.to(
-                        device=current_memory_tokens.device,
-                        dtype=current_memory_tokens.dtype,
-                    )
-
-            for j in range(batch_size):
-                if j == i:
-                    continue
-                if int(episode_ids[j]) != episode_key or int(frame_ids[j]) >= frame_key:
-                    continue
-                candidate_tokens_by_frame[int(frame_ids[j])] = source_tokens[j]
-
-            if not candidate_tokens_by_frame:
-                continue
-
-            selected_frames = sorted(candidate_tokens_by_frame)[-self.config.memory_size :]
-            selected_tokens = torch.stack([candidate_tokens_by_frame[f] for f in selected_frames], dim=0)
-            history_len = selected_tokens.shape[0]
-            history_tokens[i, :history_len] = selected_tokens
-            history_mask[i, :history_len] = False
-
-        self._update_training_history_cache(current_memory_tokens, episode_indices, frame_indices)
-        return history_tokens, history_mask
-
-    def _compute_prefix_hidden_states(
-        self,
-        prefix_embs: Tensor,
-        prefix_pad_masks: Tensor,
-        prefix_att_masks: Tensor,
-    ) -> Tensor:
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-
-        attn_dtype = self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
-        prefix_att_2d_masks_4d = prefix_att_2d_masks_4d.to(dtype=attn_dtype)
-        prefix_embs = prefix_embs.to(dtype=attn_dtype)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        def prefix_forward_func(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids):
-            (prefix_out, _), _ = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=False,
-            )
-            return prefix_out
-
-        return self._apply_checkpoint(
-            prefix_forward_func,
-            prefix_embs,
-            prefix_att_2d_masks_4d,
-            prefix_position_ids,
-        )
-
-    def _augment_prefix_with_history(
-        self,
-        prefix_embs: Tensor,
-        prefix_pad_masks: Tensor,
-        prefix_att_masks: Tensor,
-        history_tokens: Tensor | None = None,
-        memory_mask: Tensor | None = None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
-        if not self.config.use_history_memory:
-            return prefix_embs, None, None, None
-
-        prefix_hidden_states = self._compute_prefix_hidden_states(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-        )
-        if self.training:
-            fused_prefix_hidden_states = self.history_mem_bank.process_training_batch(
-                prefix_hidden_states,
-                episode_ids=episode_indices,
-                timesteps=frame_indices,
-                training_layout=self.config.memory_training_layout,
-            )
-        else:
-            batch_size = prefix_hidden_states.shape[0]
-            if episode_indices is not None:
-                runtime_episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-            elif self.runtime_episode_id is not None:
-                runtime_episode_ids = [int(self.runtime_episode_id)] * batch_size
-            else:
-                runtime_episode_ids = list(range(batch_size))
-
-            if frame_indices is not None:
-                runtime_timesteps = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-                if batch_size > 0:
-                    self.runtime_frame_index = int(max(runtime_timesteps)) + 1
-            else:
-                runtime_timesteps = list(range(self.runtime_frame_index, self.runtime_frame_index + batch_size))
-                self.runtime_frame_index += batch_size
-
-            fused_prefix_hidden_states = self.history_mem_bank.process_runtime_batch(
-                prefix_hidden_states,
-                episode_ids=runtime_episode_ids,
-                timesteps=runtime_timesteps,
-            )
-
-        residual_scale = torch.tanh(self.history_residual_scale).to(dtype=prefix_hidden_states.dtype)
-        prefix_delta = (residual_scale * (fused_prefix_hidden_states - prefix_hidden_states)).to(dtype=prefix_embs.dtype)
-        prefix_embs = prefix_embs + prefix_delta
-
-        return prefix_embs, None, None, None
+        logging.info("Disabled gradient checkpointing for PI05SpatialPytorch model")
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -1273,13 +953,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
     def sample_noise(self, shape, device):
-        return torch.normal(
+        noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
             dtype=torch.float32,
             device=device,
         )
+        return noise
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(
@@ -1331,13 +1012,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        # Embed timestep using sine-cosine positional encoding
+    def encode_time_embedding(self, timestep: Tensor) -> Tensor:
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
@@ -1347,26 +1022,127 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
 
-        # Fuse timestep + action information using an MLP
-        def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
-
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
-
         def time_mlp_func(time_emb):
             x = self.time_mlp_in(time_emb)
             x = F.silu(x)
             x = self.time_mlp_out(x)
             return F.silu(x)
 
-        time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
-        action_time_emb = action_emb
-        adarms_cond = time_emb
+        return self._apply_checkpoint(time_mlp_func, time_emb)
 
-        embs.append(action_time_emb)
-        bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-        pad_masks.append(action_time_mask)
+    def extract_spatial_context(self, images, img_masks) -> dict[str, Any]:
+        if len(images) == 0:
+            raise ValueError("At least one image is required for PI05Spatial.")
+
+        max_index = len(images) - 1
+        main_index = min(self.config.main_camera_index, max_index)
+        aux_index = min(self.config.aux_camera_index, max_index)
+
+        main_image = images[main_index]
+        main_mask = img_masks[main_index]
+        main_features = self.spatial_feature_extractor(main_image)
+
+        if len(images) == 1:
+            aux_features = [torch.zeros_like(feature_map) for feature_map in main_features]
+            aux_mask = torch.zeros_like(main_mask)
+        else:
+            aux_image = images[aux_index]
+            aux_features = self.spatial_feature_extractor(aux_image)
+            aux_mask = img_masks[aux_index]
+
+        return {
+            "main_features": main_features,
+            "aux_features": aux_features,
+            "main_mask": main_mask,
+            "aux_mask": aux_mask,
+        }
+
+    def initialize_coordinate_state(
+        self,
+        action_like: Tensor,
+        current_eef_pos: Tensor | None,
+    ) -> Tensor:
+        coord_delta = slice_action_trajectory(
+            action_like,
+            start_index=self.config.trajectory_action_start_index,
+            trajectory_dim=self.config.trajectory_dim,
+        )
+        if current_eef_pos is None:
+            return torch.cumsum(coord_delta, dim=1)
+
+        current_coord = current_eef_pos[..., : self.config.trajectory_dim]
+        if current_coord.dim() == 1:
+            current_coord = current_coord.unsqueeze(0)
+        return integrate_delta_trajectory(current_coord, coord_delta)
+
+    def apply_coord_state_corruption(
+        self,
+        coord_state: Tensor,
+        corruption_mode: Literal["shuffle", "constant"] | None = None,
+    ) -> Tensor:
+        if corruption_mode is None:
+            return coord_state
+        if corruption_mode == "shuffle":
+            if coord_state.shape[0] <= 1:
+                return coord_state
+            return torch.roll(coord_state, shifts=1, dims=0)
+        if corruption_mode == "constant":
+            return coord_state.mean(dim=0, keepdim=True).expand_as(coord_state)
+        raise ValueError(f"Unsupported coord corruption mode: {corruption_mode}")
+
+    def embed_suffix(self, noisy_actions, coord_state, timestep, state, spatial_context, camera_context):
+        """Embed noisy action tokens together with explicit coordinate anchors."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        if self.state_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
+
+        def state_proj_func(state_value):
+            return self.state_proj(state_value)
+
+        def action_proj_func(noisy_action_value):
+            return self.action_in_proj(noisy_action_value)
+
+        state_emb = self._apply_checkpoint(state_proj_func, state)
+        time_emb = self.encode_time_embedding(timestep)
+        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+        action_tokens, coord_emb = self.trajectory_tokenizer(
+            action_emb, state_emb, time_emb, coord_state
+        )
+
+        sampled_main, uv_main, valid_main = self.project_and_sample(
+            coord_state,
+            spatial_context["main_features"],
+            intrinsics=camera_context.get("main_intrinsics"),
+            transform=None,
+            image_mask=spatial_context["main_mask"],
+        )
+        sampled_aux, uv_aux, valid_aux = self.project_and_sample(
+            coord_state,
+            spatial_context["aux_features"],
+            intrinsics=camera_context.get("aux_intrinsics"),
+            transform=camera_context.get("aux_from_main"),
+            image_mask=spatial_context["aux_mask"],
+        )
+        refined_tokens, delta_coord, hidden_delta = self.geometry_refinement(
+            action_tokens,
+            coord_emb,
+            sampled_main,
+            sampled_aux,
+            state_emb,
+            time_emb,
+        )
+        pred_coord_state = coord_state + delta_coord
+        adarms_cond = time_emb
+        hidden_delta_abs_mean = hidden_delta.abs().mean(dim=(1, 2))
+        base_token_abs_mean = action_tokens.abs().mean(dim=(1, 2)).clamp_min(1e-6)
+
+        embs.append(refined_tokens)
+        bsize, action_token_dim = refined_tokens.shape[:2]
+        action_token_mask = torch.ones(bsize, action_token_dim, dtype=torch.bool, device=timestep.device)
+        pad_masks.append(action_token_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
@@ -1376,7 +1152,168 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
+        geometry_context = {
+            "coord_state": coord_state,
+            "pred_coord_state": pred_coord_state,
+            "delta_coord": delta_coord,
+            "uv_main": uv_main,
+            "uv_aux": uv_aux,
+            "valid_main": valid_main,
+            "valid_aux": valid_aux,
+            "hidden_delta_abs_mean": hidden_delta_abs_mean,
+            "hidden_delta_ratio": hidden_delta_abs_mean / base_token_abs_mean,
+            "hidden_residual_scale": hidden_delta_abs_mean.new_full(
+                hidden_delta_abs_mean.shape, self.geometry_refinement.hidden_residual_scale
+            ),
+            "coord_delta_scale": hidden_delta_abs_mean.new_full(
+                hidden_delta_abs_mean.shape, self.geometry_refinement.coord_delta_scale
+            ),
+        }
+
+        return embs, pad_masks, att_masks, adarms_cond, geometry_context
+
+    def combine_velocity_prediction(self, suffix_out: Tensor) -> Tensor:
+        v_t = self.action_out_proj(suffix_out)
+        return v_t.to(dtype=torch.float32)
+
+    def predict_refined_trajectory_from_action_like(
+        self,
+        action_like: Tensor,
+        state: Tensor,
+        *,
+        current_eef_pos: Tensor | None = None,
+        spatial_context: dict[str, Any] | None = None,
+        camera_context: dict[str, Tensor | None] | None = None,
+        images=None,
+        img_masks=None,
+        timestep: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Refine a denoised action-like sequence into a geometry-conditioned 3D trajectory."""
+        if camera_context is None:
+            camera_context = {}
+        if spatial_context is None:
+            if images is None or img_masks is None:
+                raise ValueError("images and img_masks are required when spatial_context is not provided.")
+            spatial_context = self.extract_spatial_context(images, img_masks)
+        if timestep is None:
+            timestep = torch.zeros(action_like.shape[0], dtype=torch.float32, device=action_like.device)
+
+        coord_state = self.initialize_coordinate_state(action_like, current_eef_pos)
+        _, _, _, _, geometry_context = self.embed_suffix(
+            action_like,
+            coord_state,
+            timestep,
+            state,
+            spatial_context,
+            camera_context,
+        )
+        return geometry_context
+
+    def decode_trajectory_to_actions(
+        self,
+        pred_clean_trajectory: Tensor,
+        state: Tensor,
+        denoised_actions: Tensor | None = None,
+    ) -> Tensor:
+        del pred_clean_trajectory, state
+        if denoised_actions is None:
+            raise ValueError("denoised_actions is required when pi05_spatial keeps the FM final action branch.")
+        return denoised_actions.to(dtype=torch.float32)
+
+    def apply_sequence_mask(self, value: Tensor, valid_mask: Tensor | None) -> Tensor:
+        if valid_mask is None:
+            return value
+
+        mask = valid_mask
+        while mask.dim() < value.dim():
+            mask = mask.unsqueeze(-1)
+        return value * mask.to(dtype=value.dtype)
+
+    def reduce_sequence_loss(self, value: Tensor, valid_mask: Tensor | None) -> Tensor:
+        if valid_mask is None:
+            return value.mean(dim=tuple(range(1, value.dim())))
+
+        mask = valid_mask
+        while mask.dim() < value.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.to(dtype=value.dtype).expand_as(value)
+        denom = mask.sum(dim=tuple(range(1, value.dim()))).clamp_min(1.0)
+        return (value * mask).sum(dim=tuple(range(1, value.dim()))) / denom
+
+    def compute_projection_loss(
+        self,
+        pred_trajectory: Tensor,
+        target_trajectory: Tensor,
+        camera_context: dict[str, Tensor | None],
+        spatial_context: dict[str, Any],
+        trajectory_valid_mask: Tensor | None = None,
+    ) -> Tensor:
+        view_specs = (
+            (
+                camera_context.get("main_intrinsics"),
+                None,
+                spatial_context["main_mask"],
+            ),
+            (
+                camera_context.get("aux_intrinsics"),
+                camera_context.get("aux_from_main"),
+                spatial_context["aux_mask"],
+            ),
+        )
+
+        total_loss = pred_trajectory.new_zeros(pred_trajectory.shape[0])
+        valid_views = pred_trajectory.new_zeros(pred_trajectory.shape[0])
+
+        for intrinsics, transform, image_mask in view_specs:
+            pred_grid, pred_valid = self.project_and_sample.project_points(
+                pred_trajectory,
+                intrinsics=intrinsics,
+                transform=transform,
+            )
+            target_grid, target_valid = self.project_and_sample.project_points(
+                target_trajectory,
+                intrinsics=intrinsics,
+                transform=transform,
+            )
+            valid = pred_valid & target_valid
+            if image_mask is not None:
+                valid = valid & image_mask[:, None]
+            if trajectory_valid_mask is not None:
+                valid = valid & trajectory_valid_mask
+
+            view_loss = torch.abs(pred_grid - target_grid).mean(dim=-1)
+            view_loss = torch.where(valid, view_loss, torch.zeros_like(view_loss))
+            denom = valid.to(dtype=view_loss.dtype).sum(dim=1).clamp_min(1.0)
+            total_loss = total_loss + view_loss.sum(dim=1) / denom
+            valid_views = valid_views + valid.any(dim=1).to(dtype=total_loss.dtype)
+
+        return total_loss / valid_views.clamp_min(1.0)
+
+    def compute_smoothness_loss(
+        self, trajectory: Tensor, trajectory_valid_mask: Tensor | None = None
+    ) -> Tensor:
+        if trajectory.shape[1] < 2:
+            return trajectory.new_zeros(trajectory.shape[0])
+
+        velocity = trajectory[:, 1:] - trajectory[:, :-1]
+        velocity_valid_mask = None
+        if trajectory_valid_mask is not None:
+            velocity_valid_mask = trajectory_valid_mask[:, 1:] & trajectory_valid_mask[:, :-1]
+        vel_loss = self.reduce_sequence_loss(velocity.abs(), velocity_valid_mask)
+
+        if trajectory.shape[1] < 3:
+            return vel_loss
+
+        acceleration = trajectory[:, 2:] - 2 * trajectory[:, 1:-1] + trajectory[:, :-2]
+        acceleration_valid_mask = None
+        if trajectory_valid_mask is not None:
+            acceleration_valid_mask = (
+                trajectory_valid_mask[:, 2:]
+                & trajectory_valid_mask[:, 1:-1]
+                & trajectory_valid_mask[:, :-2]
+            )
+        acc_loss = self.reduce_sequence_loss(acceleration.abs(), acceleration_valid_mask)
+        return vel_loss + acc_loss
 
     def forward(
         self,
@@ -1384,32 +1321,43 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         img_masks,
         tokens,
         masks,
-        actions,
+        state,
+        trajectory,
+        current_eef_pos=None,
+        action_targets=None,
+        camera_context=None,
+        trajectory_is_pad=None,
+        action_is_pad=None,
         noise=None,
         time=None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
-    ) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    ) -> dict[str, Tensor | None]:
+        """Do a full training forward pass and compute all spatial MVP losses."""
+        if camera_context is None:
+            camera_context = {}
+
+        diffusion_target = trajectory if action_targets is None else action_targets
+
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            noise = self.sample_noise(diffusion_target.shape, diffusion_target.device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(diffusion_target.shape[0], diffusion_target.device)
 
         time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * noise + (1 - time_expanded) * diffusion_target
+        u_t = noise - diffusion_target
+        coord_state = self.initialize_coordinate_state(x_t, current_eef_pos)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_embs, _, _, _ = self._augment_prefix_with_history(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
+        spatial_context = self.extract_spatial_context(images, img_masks)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond, geometry_context = self.embed_suffix(
+            x_t,
+            coord_state,
+            time,
+            state,
+            spatial_context,
+            camera_context,
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1443,51 +1391,136 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.combine_velocity_prediction(suffix_out)
 
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
+        trajectory_valid_mask = None
+        if trajectory_is_pad is not None:
+            trajectory_valid_mask = ~trajectory_is_pad.bool()
+        elif action_is_pad is not None:
+            trajectory_valid_mask = ~action_is_pad.bool()
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        action_valid_mask = None if action_is_pad is None else ~action_is_pad.bool()
+        if action_targets is None:
+            diffusion_loss_tensor = F.mse_loss(
+                slice_action_trajectory(
+                    u_t,
+                    start_index=self.config.trajectory_action_start_index,
+                    trajectory_dim=self.config.trajectory_dim,
+                ),
+                slice_action_trajectory(
+                    v_t,
+                    start_index=self.config.trajectory_action_start_index,
+                    trajectory_dim=self.config.trajectory_dim,
+                ),
+                reduction="none",
+            )
+            diffusion_valid_mask = trajectory_valid_mask
+        else:
+            diffusion_loss_tensor = F.mse_loss(u_t, v_t, reduction="none")
+            diffusion_valid_mask = action_valid_mask
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        diffusion_loss_tensor = self.apply_sequence_mask(diffusion_loss_tensor, diffusion_valid_mask)
+        diffusion_loss = self.reduce_sequence_loss(diffusion_loss_tensor, diffusion_valid_mask)
+
+        pred_clean_action = x_t - time_expanded * v_t
+        action_geometry_context = self.predict_refined_trajectory_from_action_like(
+            pred_clean_action,
+            state,
+            current_eef_pos=current_eef_pos,
+            spatial_context=spatial_context,
+            camera_context=camera_context,
+        )
+        pred_clean_trajectory = action_geometry_context["pred_coord_state"]
+        target_trajectory = trajectory[..., : self.config.trajectory_dim]
+        trajectory_loss_tensor = torch.abs(pred_clean_trajectory - target_trajectory)
+        trajectory_loss_tensor = self.apply_sequence_mask(trajectory_loss_tensor, trajectory_valid_mask)
+        trajectory_loss = self.reduce_sequence_loss(trajectory_loss_tensor, trajectory_valid_mask)
+        projection_loss = self.compute_projection_loss(
+            pred_clean_trajectory,
+            target_trajectory,
+            camera_context,
+            spatial_context,
+            trajectory_valid_mask=trajectory_valid_mask,
+        )
+        smoothness_loss = self.compute_smoothness_loss(
+            pred_clean_trajectory, trajectory_valid_mask=trajectory_valid_mask
+        )
+
+        pred_action = self.decode_trajectory_to_actions(
+            pred_clean_trajectory,
+            state,
+            denoised_actions=pred_clean_action,
+        )
+        action_loss_tensor = None
+        action_loss = None
+        if action_targets is not None:
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            action_loss_tensor = F.l1_loss(
+                pred_action[..., :original_action_dim],
+                action_targets[..., :original_action_dim],
+                reduction="none",
+            )
+            action_loss_tensor = self.apply_sequence_mask(action_loss_tensor, action_valid_mask)
+            action_loss = self.reduce_sequence_loss(action_loss_tensor, action_valid_mask)
+
+        return {
+            "diffusion_loss_tensor": diffusion_loss_tensor,
+            "diffusion_loss": diffusion_loss,
+            "trajectory_loss_tensor": trajectory_loss_tensor,
+            "trajectory_loss": trajectory_loss,
+            "projection_loss": projection_loss,
+            "smoothness_loss": smoothness_loss,
+            "action_loss_tensor": action_loss_tensor,
+            "action_loss": action_loss,
+            "pred_clean_trajectory": pred_clean_trajectory,
+            "pred_action": pred_action,
+            "coord_abs_mean": action_geometry_context["coord_state"].abs().mean(),
+            "delta_abs_mean": action_geometry_context["delta_coord"].abs().mean(),
+            "pred_clean_trajectory_std": pred_clean_trajectory.std(unbiased=False),
+            "geom_hidden_delta_abs_mean": action_geometry_context["hidden_delta_abs_mean"],
+            "geom_hidden_delta_ratio": action_geometry_context["hidden_delta_ratio"],
+            "geometry_hidden_residual_scale": action_geometry_context["hidden_residual_scale"],
+            "geometry_coord_delta_scale": action_geometry_context["coord_delta_scale"],
+            "valid_main_frac": action_geometry_context["valid_main"].to(dtype=torch.float32).mean(),
+            "valid_aux_frac": action_geometry_context["valid_aux"].to(dtype=torch.float32).mean(),
+        }
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def sample_actions(
+    def sample_trajectory(
         self,
         images,
         img_masks,
         tokens,
         masks,
+        state,
+        current_eef_pos=None,
+        camera_context=None,
         noise=None,
         num_steps=None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
+        coord_corruption_mode: Literal["shuffle", "constant"] | None = None,
+        return_spatial_context: bool = False,
         **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+    ) -> Tensor | tuple[Tensor, dict[str, Any]]:
+        """Run denoising and optionally return the cached spatial context for geometry decoding."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
         bsize = tokens.shape[0]
         device = tokens.device
 
+        if camera_context is None:
+            camera_context = {}
+
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
-            actions_shape = (
+            trajectory_shape = (
                 bsize,
                 self.config.chunk_size,
                 self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
-            noise = self.sample_noise(actions_shape, device)
+            )
+            noise = self.sample_noise(trajectory_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_embs, _, _, _ = self._augment_prefix_with_history(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-        )
+        spatial_context = self.extract_spatial_context(images, img_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1515,6 +1548,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    state=state,
+                    spatial_context=spatial_context,
+                    camera_context=camera_context,
+                    current_eef_pos=current_eef_pos,
+                    coord_corruption_mode=coord_corruption_mode,
                 )
 
             if self._rtc_enabled():
@@ -1538,7 +1576,39 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if return_spatial_context:
+            return x_t, spatial_context
         return x_t
+
+    @torch.no_grad()
+    def sample_actions(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        state,
+        current_eef_pos=None,
+        camera_context=None,
+        noise=None,
+        num_steps=None,
+        coord_corruption_mode: Literal["shuffle", "constant"] | None = None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
+        denoised_actions = self.sample_trajectory(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            state,
+            current_eef_pos=current_eef_pos,
+            camera_context=camera_context,
+            noise=noise,
+            num_steps=num_steps,
+            coord_corruption_mode=coord_corruption_mode,
+            **kwargs,
+        )
+        return denoised_actions.to(dtype=torch.float32)
 
     def denoise_step(
         self,
@@ -1546,9 +1616,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        state,
+        spatial_context,
+        camera_context,
+        current_eef_pos=None,
+        coord_corruption_mode: Literal["shuffle", "constant"] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        coord_state = self.initialize_coordinate_state(x_t, current_eef_pos)
+        coord_state = self.apply_coord_state_corruption(coord_state, coord_corruption_mode)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond, geometry_context = self.embed_suffix(
+            x_t,
+            coord_state,
+            timestep,
+            state,
+            spatial_context,
+            camera_context,
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1577,18 +1661,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        return self.combine_velocity_prediction(suffix_out)
 
 
-class PI05MemoryPolicy(PreTrainedPolicy):
-    """PI05 Policy for LeRobot."""
+class PI05SpatialPolicy(PreTrainedPolicy):
+    """PI05Spatial Policy for LeRobot."""
 
-    config_class = PI05MemoryConfig
-    name = "pi05_memory"
+    config_class = PI05SpatialConfig
+    name = "pi05_spatial"
 
     def __init__(
         self,
-        config: PI05MemoryConfig,
+        config: PI05SpatialConfig,
         **kwargs,
     ):
         """
@@ -1599,9 +1683,9 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize the core PI05 model
+        # Initialize the core PI05Spatial model
         self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05SpatialPytorch(config, rtc_processor=self.rtc_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1610,6 +1694,68 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         self.model.to(config.device)
 
         self.reset()
+
+    @classmethod
+    def _inherit_compatible_pretrained_settings(
+        cls,
+        config: PI05SpatialConfig,
+        pretrained_name_or_path: str | Path,
+        *,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+    ) -> PI05SpatialConfig:
+        """Reuse compatible runtime settings from a source checkpoint when bootstrapping from base pi05."""
+        try:
+            source_config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+            )
+        except Exception as exc:  # best effort only
+            logging.warning(f"Could not inspect pretrained config for PI05Spatial inheritance: {exc}")
+            return config
+
+        if isinstance(source_config, PI05SpatialConfig):
+            return config
+
+        default_config = cls.config_class()
+        inherited_fields = []
+        field_names = (
+            "empty_cameras",
+            "n_action_steps",
+            "chunk_size",
+            "image_resolution",
+            "max_state_dim",
+            "max_action_dim",
+            "num_inference_steps",
+            "tokenizer_max_length",
+        )
+        for field_name in field_names:
+            if not hasattr(source_config, field_name):
+                continue
+            if getattr(config, field_name) != getattr(default_config, field_name):
+                continue
+            setattr(config, field_name, copy.deepcopy(getattr(source_config, field_name)))
+            inherited_fields.append(field_name)
+
+        if inherited_fields:
+            logging.info(
+                "PI05Spatial inherited compatible pretrained settings from %s: %s",
+                pretrained_name_or_path,
+                ", ".join(inherited_fields),
+            )
+
+        return config
 
     @classmethod
     def from_pretrained(
@@ -1629,7 +1775,7 @@ class PI05MemoryPolicy(PreTrainedPolicy):
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
         print(
-            "The PI05 model is a direct port of the OpenPI implementation. \n"
+            "The PI05Spatial model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
             "Original implementation: https://github.com/Physical-Intelligence/openpi"
         )
@@ -1648,6 +1794,18 @@ class PI05MemoryPolicy(PreTrainedPolicy):
                 local_files_only=local_files_only,
                 revision=revision,
                 **kwargs,
+            )
+        elif isinstance(config, PI05SpatialConfig):
+            config = cls._inherit_compatible_pretrained_settings(
+                config,
+                pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
             )
 
         # Initialize model without loading weights
@@ -1674,7 +1832,7 @@ class PI05MemoryPolicy(PreTrainedPolicy):
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
-                print("Loaded state dict from model.safetensors")
+                print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
@@ -1763,16 +1921,12 @@ class PI05MemoryPolicy(PreTrainedPolicy):
                     logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
                     continue
 
-            # Handle MLP naming changes for pi05_memory
-            # pi05_memory model expects time_mlp_*, but checkpoint might have action_time_mlp_*
+            # Handle MLP naming changes for pi05_spatial
+            # pi05_spatial model expects time_mlp_*, but checkpoint might have action_time_mlp_*
             if key.startswith("action_time_mlp_in."):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05_memory
-            if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05_memory mode: {key}")
-                continue
 
             # Handle vision tower embedding layer potential differences
             if "patch_embedding" in key:
@@ -1800,8 +1954,6 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.reset_memory_on_new_episode and hasattr(self.model, "reset_history_memory"):
-            self.model.reset_history_memory()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1885,10 +2037,110 @@ class PI05MemoryPolicy(PreTrainedPolicy):
 
         return images, img_masks
 
+    def _as_batched_tensor(self, value: Any) -> Tensor:
+        device = next(self.parameters()).device
+        if not isinstance(value, Tensor):
+            value = torch.as_tensor(value, dtype=torch.float32, device=device)
+        else:
+            value = value.to(device=device)
+            if value.dtype != torch.float32:
+                value = value.to(torch.float32)
+        return value
+
+    def _as_batched_mask(self, value: Any) -> Tensor:
+        device = next(self.parameters()).device
+        if not isinstance(value, Tensor):
+            value = torch.as_tensor(value, dtype=torch.bool, device=device)
+        else:
+            value = value.to(device=device, dtype=torch.bool)
+        return value
+
+    def _prepare_optional_matrix(self, batch: dict[str, Tensor], key: str) -> Tensor | None:
+        value = batch.get(key)
+        if value is None:
+            return None
+        value = self._as_batched_tensor(value)
+        if value.dim() == 2:
+            value = value.unsqueeze(0)
+        return value
+
+    def extract_camera_context(self, batch: dict[str, Tensor]) -> dict[str, Tensor | None]:
+        return {
+            "main_intrinsics": self._prepare_optional_matrix(batch, self.config.camera_main_intrinsics_key),
+            "aux_intrinsics": self._prepare_optional_matrix(batch, self.config.camera_aux_intrinsics_key),
+            "aux_from_main": self._prepare_optional_matrix(batch, self.config.camera_aux_from_main_key),
+        }
+
+    def prepare_state(self, batch):
+        """Pad state and ensure a batch dimension exists."""
+        state = self._as_batched_tensor(batch[OBS_STATE])
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        state = pad_vector(state, self.config.max_state_dim)
+        return state
+
     def prepare_action(self, batch):
         """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        actions = self._as_batched_tensor(batch[ACTION])
+        if actions.dim() == 2:
+            actions = actions.unsqueeze(0)
+        actions = pad_vector(actions, self.config.max_action_dim)
         return actions
+
+    def prepare_optional_pad_mask(self, batch: dict[str, Tensor], key: str) -> Tensor | None:
+        value = batch.get(key)
+        if value is None:
+            return None
+        value = self._as_batched_mask(value)
+        if value.dim() == 1:
+            value = value.unsqueeze(0)
+        return value[:, : self.config.chunk_size]
+
+    def prepare_trajectory(self, batch, actions: Tensor | None = None) -> Tensor:
+        trajectory = batch.get(self.config.trajectory_key)
+        if trajectory is None:
+            if actions is None:
+                actions = self.prepare_action(batch)
+
+            delta_actions = slice_action_trajectory(
+                actions,
+                start_index=self.config.trajectory_action_start_index,
+                trajectory_dim=self.config.trajectory_dim,
+            )
+
+            current_eef_pos = batch.get(self.config.current_eef_pos_key)
+            if current_eef_pos is not None and self.config.derive_trajectory_from_eef_delta:
+                current_eef_pos = self._as_batched_tensor(current_eef_pos)
+                if current_eef_pos.dim() == 1:
+                    current_eef_pos = current_eef_pos.unsqueeze(0)
+                current_eef_pos = current_eef_pos[..., : self.config.trajectory_dim]
+                trajectory = integrate_delta_trajectory(current_eef_pos, delta_actions)
+            elif not self.config.use_action_as_trajectory_fallback:
+                raise ValueError(
+                    f"Trajectory key '{self.config.trajectory_key}' is missing and action fallback is disabled."
+                )
+            else:
+                trajectory = delta_actions
+        else:
+            trajectory = self._as_batched_tensor(trajectory)
+            if trajectory.dim() == 2:
+                trajectory = trajectory.unsqueeze(0)
+            trajectory = trajectory[..., : self.config.trajectory_dim]
+
+        return trajectory
+
+    def prepare_current_eef_pos(self, batch):
+        current_eef_pos = batch.get(self.config.current_eef_pos_key)
+        if current_eef_pos is None:
+            current_eef_pos = batch.get(OBS_STATE)
+        if current_eef_pos is None:
+            return None
+        current_eef_pos = self._as_batched_tensor(current_eef_pos)
+        if current_eef_pos.dim() == 1:
+            current_eef_pos = current_eef_pos.unsqueeze(0)
+        if current_eef_pos.dim() == 3:
+            current_eef_pos = current_eef_pos[:, 0]
+        return current_eef_pos[..., : self.config.trajectory_dim]
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -1908,37 +2160,48 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
+    def predict_trajectory_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+        """Predict a future 3D trajectory in the main camera frame."""
+        self.eval()
+
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        state = self.prepare_state(batch)
+        current_eef_pos = self.prepare_current_eef_pos(batch)
+        camera_context = self.extract_camera_context(batch)
+        sampled_actions = self.model.sample_trajectory(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            state,
+            current_eef_pos=current_eef_pos,
+            camera_context=camera_context,
+            **kwargs,
+        )
+        return self.model.initialize_coordinate_state(sampled_actions, current_eef_pos)
+
+    @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        episode_indices = batch.get("episode_index")
-        if episode_indices is not None and hasattr(self.model, "runtime_episode_id"):
-            episode_indices = episode_indices.reshape(episode_indices.shape[0], -1)[:, 0]
-            if episode_indices.numel() > 0 and torch.all(episode_indices == episode_indices[0]):
-                current_episode_id = int(episode_indices[0].item())
-                previous_episode_id = self.model.runtime_episode_id
-                if (
-                    self.config.reset_memory_on_new_episode
-                    and previous_episode_id is not None
-                    and current_episode_id != previous_episode_id
-                ):
-                    self.model.reset_history_memory()
-                self.model.runtime_episode_id = current_episode_id
-
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        frame_indices = batch.get("frame_index")
+        state = self.prepare_state(batch)
+        current_eef_pos = self.prepare_current_eef_pos(batch)
+        camera_context = self.extract_camera_context(batch)
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+        # Sample actions using the model (pass through RTC kwargs)
         actions = self.model.sample_actions(
             images,
             img_masks,
             tokens,
             masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
+            state,
+            current_eef_pos=current_eef_pos,
+            camera_context=camera_context,
             **kwargs,
         )
 
@@ -1960,47 +2223,73 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-
+        state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
-        episode_indices = batch.get("episode_index")
-        frame_indices = batch.get("frame_index")
+        trajectory = self.prepare_trajectory(batch, actions=actions)
+        current_eef_pos = self.prepare_current_eef_pos(batch)
+        trajectory_is_pad = self.prepare_optional_pad_mask(batch, self.config.trajectory_pad_key)
+        action_is_pad = self.prepare_optional_pad_mask(batch, self.config.action_pad_key)
+        camera_context = self.extract_camera_context(batch)
 
-        # Compute loss with a simple batch-internal history window when episode/frame indices are available.
-        losses = self.model.forward(
+        outputs = self.model.forward(
             images,
             img_masks,
             tokens,
             masks,
-            actions,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
+            state,
+            trajectory,
+            current_eef_pos=current_eef_pos,
+            action_targets=actions,
+            camera_context=camera_context,
+            trajectory_is_pad=trajectory_is_pad if self.config.mask_padding_loss else None,
+            action_is_pad=action_is_pad if self.config.mask_padding_loss else None,
         )
+        total_loss = (
+            outputs["diffusion_loss"]
+            + self.config.lambda_trajectory * outputs["trajectory_loss"]
+            + self.config.lambda_projection * outputs["projection_loss"]
+            + self.config.lambda_smooth * outputs["smoothness_loss"]
+        )
+        if outputs["action_loss"] is not None:
+            total_loss = total_loss + self.config.lambda_action * outputs["action_loss"]
 
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        loss_tensor_for_reporting = outputs["action_loss_tensor"]
+        if loss_tensor_for_reporting is None:
+            loss_tensor_for_reporting = outputs["diffusion_loss_tensor"]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_tensor_for_reporting.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "diffusion_loss": outputs["diffusion_loss"].mean().item(),
+            "trajectory_loss": outputs["trajectory_loss"].mean().item(),
+            "projection_loss": outputs["projection_loss"].mean().item(),
+            "smoothness_loss": outputs["smoothness_loss"].mean().item(),
+            "action_loss": 0.0 if outputs["action_loss"] is None else outputs["action_loss"].mean().item(),
+            "coord_abs_mean": outputs["coord_abs_mean"].mean().item(),
+            "delta_abs_mean": outputs["delta_abs_mean"].mean().item(),
+            "pred_clean_trajectory_std": outputs["pred_clean_trajectory_std"].mean().item(),
+            "geom_hidden_delta_abs_mean": outputs["geom_hidden_delta_abs_mean"].mean().item(),
+            "geom_hidden_delta_ratio": outputs["geom_hidden_delta_ratio"].mean().item(),
+            "geometry_hidden_residual_scale": outputs["geometry_hidden_residual_scale"].mean().item(),
+            "geometry_coord_delta_scale": outputs["geometry_coord_delta_scale"].mean().item(),
+            "valid_main_frac": outputs["valid_main_frac"].mean().item(),
+            "valid_aux_frac": outputs["valid_aux_frac"].mean().item(),
         }
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            loss_dict["loss"] = total_loss.mean().item()
+            return total_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = total_loss.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
-    def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0.5 fine-tuning."""
+    def _get_default_peft_targets(self) -> dict[str, Any]:
+        """Return default PEFT target modules for PI05Spatial fine-tuning."""
         common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+            "state_proj|action_in_proj|action_out_proj|time_mlp_in|time_mlp_out|"
+            "trajectory_tokenizer|geometry_refinement|trajectory_decoder|spatial_feature_extractor"
         )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}).*)"
         return {
             "target_modules": target_modules,
             "modules_to_save": [],

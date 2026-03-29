@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+﻿# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@ from .pi0_residual_every_step.configuration_pi0_residual_every_step import PI0Re
 from .pi0_residual_laststep.configuration_pi0_residual_laststep import PI0ResidualLastStepConfig as PI0ResidualLastStepConfig
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
+from .pi05_word.configuration_pi05_word import PI05WordConfig as PI05WordConfig
+from .pi05_spatial.configuration_pi05_spatial import PI05SpatialConfig as PI05SpatialConfig
 from .pi05_memory.configuration_pi05_memory import PI05MemoryConfig as PI05MemoryConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .smolvla.processor_smolvla import SmolVLANewLineProcessor
@@ -34,6 +36,8 @@ __all__ = [
     "DiffusionConfig",
     "PI0Config",
     "PI05Config",
+    "PI05WordConfig",
+    "PI05SpatialConfig",
     "PI05MemoryConfig",
     "PI0ResidualEveryStepConfig",
     "PI0ResidualLastStepConfig",
@@ -46,3 +50,4 @@ __all__ = [
     "XVLAConfig",
     "WallXConfig",
 ]
+

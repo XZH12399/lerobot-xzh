@@ -26,9 +26,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_IMAGE_SIZE = 224
 
 
-@PreTrainedConfig.register_subclass("pi05_memory")
+@PreTrainedConfig.register_subclass("pi05_spatial")
 @dataclass
-class PI05MemoryConfig(PreTrainedConfig):
+class PI05SpatialConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
@@ -61,25 +61,43 @@ class PI05MemoryConfig(PreTrainedConfig):
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 
-    tokenizer_max_length: int = 200  # see openpi `__post_init__`
+    # Trajectory representation and observation wiring.
+    trajectory_dim: int = 3
+    trajectory_key: str = f"{OBS_STATE}.future_eef_pos"
+    trajectory_source_key: str = OBS_STATE
+    trajectory_source_start_index: int = 0
+    trajectory_pad_key: str = f"{OBS_STATE}.future_eef_pos_is_pad"
+    trajectory_source_pad_key: str = f"{OBS_STATE}_is_pad"
+    current_eef_pos_key: str = f"{OBS_STATE}.eef_pos"
+    use_observation_trajectory_supervision: bool = True
+    derive_trajectory_from_eef_delta: bool = True
+    trajectory_action_start_index: int = 0
+    use_action_as_trajectory_fallback: bool = True
+    action_pad_key: str = "action_is_pad"
+    mask_padding_loss: bool = True
 
-    # History memory baseline settings
-    use_history_memory: bool = True
-    memory_size: int = 16
-    memory_dim: int = 512
-    memory_num_heads: int = 8
-    memory_dropout: float = 0.1
-    memory_fusion: str = "gated"
-    reset_memory_on_new_episode: bool = True
-    use_time_embedding_in_memory: bool = True
-    memory_residual_scale_init: float = 0.0
-    training_history_mode: str = "batch_fifo"
-    use_history_apply_gate: bool = True
-    history_apply_gate_bias_init: float = -2.0
-    memory_retrieval_layers: int = 2
-    memory_consolidate_type: str = "fifo"
-    memory_update_fused: bool = False
-    memory_training_layout: str = "batch_sorted"
+    # Camera and projection wiring. The target trajectory is assumed to live in the main camera frame.
+    camera_main_intrinsics_key: str = "observation.camera.main.intrinsics"
+    camera_aux_intrinsics_key: str = "observation.camera.aux.intrinsics"
+    camera_aux_from_main_key: str = "observation.camera.aux.T_main"
+    main_camera_index: int = 0
+    aux_camera_index: int = 1
+    projection_fallback_scale: float = 0.25
+
+    # Spatial geometry branch.
+    spatial_feature_dims: tuple[int, int, int] = (32, 64, 128)
+    geometry_hidden_dim: int = 512
+    geometry_num_fourier_bands: int = 8
+    geometry_hidden_residual_scale: float = 0.25
+    geometry_coord_delta_scale: float = 0.1
+    geometry_local_window_radius: int = 1
+    geometry_local_window_sigma: float = 1.0
+
+    # Lightweight trajectory-to-action decoder that keeps the current LeRobot API intact.
+    trajectory_decoder_hidden_dim: int = 512
+    predict_gripper: bool = False
+
+    tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -113,6 +131,12 @@ class PI05MemoryConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # Auxiliary trajectory losses for the spatial MVP.
+    lambda_trajectory: float = 1.0
+    lambda_projection: float = 0.5
+    lambda_smooth: float = 0.1
+    lambda_action: float = 0.5
+
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
@@ -133,32 +157,51 @@ class PI05MemoryConfig(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
-        if self.memory_size <= 0:
-            raise ValueError(f"memory_size must be positive, got {self.memory_size}")
+        if self.trajectory_dim <= 0:
+            raise ValueError(f"trajectory_dim must be positive, got {self.trajectory_dim}")
 
-        if self.memory_dim <= 0:
-            raise ValueError(f"memory_dim must be positive, got {self.memory_dim}")
+        if self.trajectory_dim > self.max_action_dim:
+            raise ValueError(
+                f"trajectory_dim ({self.trajectory_dim}) cannot be greater than max_action_dim ({self.max_action_dim})"
+            )
 
-        if self.memory_num_heads <= 0:
-            raise ValueError(f"memory_num_heads must be positive, got {self.memory_num_heads}")
+        if self.trajectory_action_start_index < 0:
+            raise ValueError(
+                f"trajectory_action_start_index must be non-negative, got {self.trajectory_action_start_index}"
+            )
 
-        if self.memory_dropout < 0:
-            raise ValueError(f"memory_dropout must be non-negative, got {self.memory_dropout}")
+        if self.trajectory_action_start_index + self.trajectory_dim > self.max_action_dim:
+            raise ValueError(
+                "trajectory_action_start_index + trajectory_dim must stay within max_action_dim, "
+                f"got start={self.trajectory_action_start_index}, trajectory_dim={self.trajectory_dim}, "
+                f"max_action_dim={self.max_action_dim}"
+            )
 
-        if self.memory_fusion not in ["gated", "add"]:
-            raise ValueError(f"Invalid memory_fusion: {self.memory_fusion}")
+        if len(self.spatial_feature_dims) != 3:
+            raise ValueError(
+                f"spatial_feature_dims must contain exactly 3 feature widths, got {self.spatial_feature_dims}"
+            )
 
-        if self.training_history_mode not in ["batch_fifo", "legacy_cache"]:
-            raise ValueError(f"Invalid training_history_mode: {self.training_history_mode}")
+        if self.geometry_hidden_residual_scale < 0:
+            raise ValueError(
+                "geometry_hidden_residual_scale must be non-negative, "
+                f"got {self.geometry_hidden_residual_scale}"
+            )
 
-        if self.memory_retrieval_layers <= 0:
-            raise ValueError(f"memory_retrieval_layers must be positive, got {self.memory_retrieval_layers}")
+        if self.geometry_coord_delta_scale < 0:
+            raise ValueError(
+                f"geometry_coord_delta_scale must be non-negative, got {self.geometry_coord_delta_scale}"
+            )
 
-        if self.memory_consolidate_type not in ["fifo", "tome"]:
-            raise ValueError(f"Invalid memory_consolidate_type: {self.memory_consolidate_type}")
+        if self.geometry_local_window_radius < 0:
+            raise ValueError(
+                f"geometry_local_window_radius must be non-negative, got {self.geometry_local_window_radius}"
+            )
 
-        if self.memory_training_layout not in ["batch_sorted", "stream"]:
-            raise ValueError(f"Invalid memory_training_layout: {self.memory_training_layout}")
+        if self.geometry_local_window_sigma <= 0:
+            raise ValueError(
+                f"geometry_local_window_sigma must be positive, got {self.geometry_local_window_sigma}"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -200,6 +243,14 @@ class PI05MemoryConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )
+
+    @property
+    def observation_delta_indices_by_key(self) -> dict[str, list[int]]:
+        if not self.use_observation_trajectory_supervision:
+            return {}
+        # Query the current EE position plus the next chunk_size future positions, then
+        # let the processor split them into a current state and an explicit future trajectory.
+        return {self.trajectory_source_key: list(range(self.chunk_size + 1))}
 
     @property
     def observation_delta_indices(self) -> None:

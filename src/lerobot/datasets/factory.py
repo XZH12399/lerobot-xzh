@@ -54,13 +54,20 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    observation_delta_indices_by_key = getattr(cfg, "observation_delta_indices_by_key", None) or {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+        observation_delta_indices = None
+        if key in observation_delta_indices_by_key:
+            observation_delta_indices = observation_delta_indices_by_key[key]
+        elif key.startswith(OBS_PREFIX):
+            observation_delta_indices = cfg.observation_delta_indices
+
+        if observation_delta_indices is not None:
+            delta_timestamps[key] = [i / ds_meta.fps for i in observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

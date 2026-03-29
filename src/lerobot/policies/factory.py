@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -37,6 +37,8 @@ from lerobot.policies.pi0_residual_every_step.configuration_pi0_residual_every_s
 from lerobot.policies.pi0_residual_laststep.configuration_pi0_residual_laststep import PI0ResidualLastStepConfig
 from lerobot.policies.pi0_anchor.configuration_pi0_anchor import PI0AnchorConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05_word.configuration_pi05_word import PI05WordConfig
+from lerobot.policies.pi05_spatial.configuration_pi05_spatial import PI05SpatialConfig
 from lerobot.policies.pi05_memory.configuration_pi05_memory import PI05MemoryConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -71,7 +73,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-              "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
+              "vqbet", "pi0", "pi05", "pi05_spatial", "sac", "reward_classifier",
+              "smolvla", "wall_x".
 
     Returns:
         The policy class corresponding to the given name.
@@ -123,6 +126,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_word":
+        from lerobot.policies.pi05_word.modeling_pi05_word import PI05WordPolicy
+
+        return PI05WordPolicy
+    elif name == "pi05_spatial":
+        from lerobot.policies.pi05_spatial.modeling_pi05_spatial import PI05SpatialPolicy
+
+        return PI05SpatialPolicy
     elif name == "pi05_memory":
         from lerobot.policies.pi05_memory.modeling_pi05_memory import PI05MemoryPolicy
 
@@ -171,8 +182,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
 
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
-                     "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "smolvla",
-                     "reward_classifier", "wall_x".
+                     "diffusion", "act", "vqbet", "pi0", "pi05", "pi05_spatial",
+                     "sac", "smolvla", "reward_classifier", "wall_x".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -201,6 +212,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0ResidualLastStepConfig(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_word":
+        return PI05WordConfig(**kwargs)
+    elif policy_type == "pi05_spatial":
+        return PI05SpatialConfig(**kwargs)
     elif policy_type == "pi05_memory":
         return PI05MemoryConfig(**kwargs)
     elif policy_type == "sac":
@@ -275,7 +290,15 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
-    if pretrained_path:
+    should_load_pretrained_processors = pretrained_path and (
+        not isinstance(policy_cfg, PI05SpatialConfig) or kwargs.get("dataset_stats") is None
+    )
+
+    if should_load_pretrained_processors:
+        # PI05Spatial needs a custom processor during training so it can derive
+        # future trajectory supervision from dataset batches. During env-only
+        # eval/inference there are no dataset stats to rebuild the normalizer,
+        # so we must reuse the saved pretrained processors instead.
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -398,6 +421,24 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, PI05WordConfig):
+        from lerobot.policies.pi05_word.processor_pi05_word import make_pi05_word_pre_post_processors
+
+        processors = make_pi05_word_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05SpatialConfig):
+        from lerobot.policies.pi05_spatial.processor_pi05_spatial import (
+            make_pi05_spatial_pre_post_processors,
+        )
+
+        processors = make_pi05_spatial_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, PI05MemoryConfig):
         from lerobot.policies.pi05_memory.processor_pi05_memory import make_pi05_memory_pre_post_processors
 
@@ -498,7 +539,7 @@ def make_policy(
         env_cfg: Environment configuration used to infer feature shapes and types.
                  One of `ds_meta` or `env_cfg` must be provided.
         rename_map: Optional mapping of dataset or environment feature keys to match
-                 expected policy feature names (e.g., `"left"` �?`"camera1"`).
+                 expected policy feature names (e.g., `"left"` 锟?`"camera1"`).
 
     Returns:
         An instantiated and device-placed policy model.
@@ -662,5 +703,4 @@ def _make_processors_from_policy_config(
     module = importlib.import_module(module_path)
     function = getattr(module, function_name)
     return function(config, dataset_stats=dataset_stats)
-
 

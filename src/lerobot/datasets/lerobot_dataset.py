@@ -16,6 +16,7 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -173,6 +174,12 @@ class LeRobotDatasetMetadata:
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
     ) -> None:
+        max_workers_env = os.getenv("LEROBOT_SNAPSHOT_DOWNLOAD_MAX_WORKERS", "1")
+        try:
+            max_workers = max(1, int(max_workers_env))
+        except ValueError:
+            max_workers = 1
+
         snapshot_download(
             self.repo_id,
             repo_type="dataset",
@@ -180,6 +187,7 @@ class LeRobotDatasetMetadata:
             local_dir=self.root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            max_workers=max_workers,
         )
 
     @property

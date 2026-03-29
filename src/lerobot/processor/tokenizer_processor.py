@@ -24,6 +24,7 @@ token IDs and attention masks, which are then added to the observation dictionar
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -108,7 +109,14 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            tokenizer_name = os.environ.get("LEROBOT_TOKENIZER_PATH", self.tokenizer_name)
+            local_files_only = os.environ.get("LEROBOT_TOKENIZER_LOCAL_FILES_ONLY", "0") == "1"
+            if os.path.exists(tokenizer_name):
+                local_files_only = True
+            self.input_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                local_files_only=local_files_only,
+            )
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "

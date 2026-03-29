@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+detect_project_dir() {
+  local candidates=(
+    "$HOME/XZH/project/lerobot-xzh"
+    "$HOME/projects/lerobot-xzh"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$HOME/XZH/project/lerobot-xzh"
+}
+
+PROJECT_DIR="${PROJECT_DIR:-$(detect_project_dir)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_DIR/outputs/pi05_family}"
+LOG_ROOT="${LOG_ROOT:-$PROJECT_DIR/logs/pi05_family}"
+BENCHMARK_TASK="${BENCHMARK_TASK:-libero_90}"
+TRAIN_STEPS="${TRAIN_STEPS:-5000}"
+EVAL_EPISODES="${EVAL_EPISODES:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+LOG_FREQ="${LOG_FREQ:-20}"
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
+DATASET_ROOT="${DATASET_ROOT:-$HOME/data/libero}"
+
+WORKER_SCRIPT="$PROJECT_DIR/run_pi05_family_libero_train_eval.sh"
+WATCHDOG_SCRIPT="$PROJECT_DIR/scripts/watch_jobs_then_restart_keeper.sh"
+
+PI05_JOB_NAME="${PI05_JOB_NAME:-pi05_${BENCHMARK_TASK}_step$(printf '%06d' "$TRAIN_STEPS")_${RUN_TAG}}"
+PI05_SPATIAL_JOB_NAME="${PI05_SPATIAL_JOB_NAME:-pi05_spatial_${BENCHMARK_TASK}_step$(printf '%06d' "$TRAIN_STEPS")_${RUN_TAG}}"
+
+PI05_WRAPPER_LOG="${PI05_WRAPPER_LOG:-$LOG_ROOT/${PI05_JOB_NAME}.wrapper.log}"
+PI05_SPATIAL_WRAPPER_LOG="${PI05_SPATIAL_WRAPPER_LOG:-$LOG_ROOT/${PI05_SPATIAL_JOB_NAME}.wrapper.log}"
+WATCHDOG_LOG="${WATCHDOG_LOG:-$LOG_ROOT/keeper_watchdog_${BENCHMARK_TASK}_step$(printf '%06d' "$TRAIN_STEPS")_${RUN_TAG}.log}"
+
+mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
+
+if [[ ! -x "$WORKER_SCRIPT" ]]; then
+  echo "[ERROR] worker script not executable: $WORKER_SCRIPT"
+  exit 1
+fi
+
+if [[ ! -x "$WATCHDOG_SCRIPT" ]]; then
+  echo "[ERROR] watchdog script not executable: $WATCHDOG_SCRIPT"
+  exit 1
+fi
+
+echo "[LAUNCHER] stopping existing keepers"
+pkill -f gpu_memory_keeper.py || true
+sleep 3
+
+echo "[LAUNCHER] launching pi05 on GPU0"
+nohup env \
+  CUDA_VISIBLE_DEVICES=0 \
+  MODEL_VARIANT=pi05 \
+  JOB_NAME="$PI05_JOB_NAME" \
+  BENCHMARK_TASK="$BENCHMARK_TASK" \
+  TRAIN_STEPS="$TRAIN_STEPS" \
+  EVAL_EPISODES="$EVAL_EPISODES" \
+  BATCH_SIZE="$BATCH_SIZE" \
+  NUM_WORKERS="$NUM_WORKERS" \
+  OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+  MKL_NUM_THREADS="$MKL_NUM_THREADS" \
+  OPENBLAS_NUM_THREADS="$OPENBLAS_NUM_THREADS" \
+  NUMEXPR_NUM_THREADS="$NUMEXPR_NUM_THREADS" \
+  TOKENIZERS_PARALLELISM="$TOKENIZERS_PARALLELISM" \
+  LOG_FREQ="$LOG_FREQ" \
+  DATASET_ROOT="$DATASET_ROOT" \
+  bash "$WORKER_SCRIPT" > "$PI05_WRAPPER_LOG" 2>&1 &
+PI05_PID=$!
+
+echo "[LAUNCHER] launching pi05_spatial on GPU1"
+nohup env \
+  CUDA_VISIBLE_DEVICES=1 \
+  MODEL_VARIANT=pi05_spatial \
+  JOB_NAME="$PI05_SPATIAL_JOB_NAME" \
+  BENCHMARK_TASK="$BENCHMARK_TASK" \
+  TRAIN_STEPS="$TRAIN_STEPS" \
+  EVAL_EPISODES="$EVAL_EPISODES" \
+  BATCH_SIZE="$BATCH_SIZE" \
+  NUM_WORKERS="$NUM_WORKERS" \
+  LOG_FREQ="$LOG_FREQ" \
+  DATASET_ROOT="$DATASET_ROOT" \
+  bash "$WORKER_SCRIPT" > "$PI05_SPATIAL_WRAPPER_LOG" 2>&1 &
+PI05_SPATIAL_PID=$!
+
+echo "[LAUNCHER] launching watchdog"
+nohup env \
+  WATCH_PIDS="$PI05_PID $PI05_SPATIAL_PID" \
+  bash "$WATCHDOG_SCRIPT" > "$WATCHDOG_LOG" 2>&1 &
+WATCHDOG_PID=$!
+
+echo "PI05_PID=$PI05_PID"
+echo "PI05_WRAPPER_LOG=$PI05_WRAPPER_LOG"
+echo "PI05_SPATIAL_PID=$PI05_SPATIAL_PID"
+echo "PI05_SPATIAL_WRAPPER_LOG=$PI05_SPATIAL_WRAPPER_LOG"
+echo "NUM_WORKERS=$NUM_WORKERS"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
+echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
+echo "OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS"
+echo "NUMEXPR_NUM_THREADS=$NUMEXPR_NUM_THREADS"
+echo "TOKENIZERS_PARALLELISM=$TOKENIZERS_PARALLELISM"
+echo "WATCHDOG_PID=$WATCHDOG_PID"
+echo "WATCHDOG_LOG=$WATCHDOG_LOG"

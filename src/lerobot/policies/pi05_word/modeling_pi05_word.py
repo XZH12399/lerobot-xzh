@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
 #
@@ -18,7 +18,7 @@ import builtins
 import copy
 import logging
 import math
-from collections import defaultdict, deque
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
@@ -47,7 +47,7 @@ else:
     layernorm_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.pi05_memory.configuration_pi05_memory import DEFAULT_IMAGE_SIZE, PI05MemoryConfig
+from lerobot.policies.pi05_word.configuration_pi05_word import DEFAULT_IMAGE_SIZE, PI05WordConfig
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
@@ -62,35 +62,6 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
-
-
-class TimestepEmbedder(nn.Module):
-    """MemoryVLA-style timestep embedding."""
-
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t: Tensor, dim: int, max_period: int = 10000) -> Tensor:
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t: Tensor) -> Tensor:
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(next(self.mlp.parameters()).dtype)
-        return self.mlp(t_freq)
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -175,338 +146,6 @@ def pad_vector(vector, new_dim):
     if vector.shape[-1] >= new_dim:
         return vector
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
-
-
-class HistoryMemoryEncoder(nn.Module):
-    """Compresses the current hidden state into a history memory token."""
-
-    def __init__(self, input_dim: int, memory_dim: int):
-        super().__init__()
-        self.proj = nn.Linear(input_dim, memory_dim)
-        self.norm = nn.LayerNorm(memory_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.norm(self.proj(x))
-
-
-class HistoryRetriever(nn.Module):
-    """Retrieves a summary vector from the explicit history memory tokens."""
-
-    def __init__(self, query_dim: int, memory_dim: int, num_heads: int, dropout: float):
-        super().__init__()
-        self.query_proj = nn.Linear(query_dim, memory_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=memory_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm = nn.LayerNorm(memory_dim)
-
-    def forward(
-        self,
-        query: Tensor,
-        memory_tokens: Tensor,
-        memory_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        q = self.query_proj(query)
-        out, attn = self.attn(
-            q,
-            memory_tokens,
-            memory_tokens,
-            key_padding_mask=memory_mask,
-            need_weights=True,
-        )
-        return self.norm(out), attn
-
-
-class GatedMemoryFusion(nn.Module):
-    """Fuses the current hidden state with retrieved history information."""
-
-    def __init__(self, hidden_dim: int, memory_dim: int):
-        super().__init__()
-        self.memory_to_hidden = nn.Linear(memory_dim, hidden_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-
-        # Start close to the pretrained pi05 behavior and let history influence grow gradually.
-        final_linear = self.gate[-1]
-        nn.init.zeros_(final_linear.weight)
-        nn.init.constant_(final_linear.bias, -2.0)
-
-    def forward(self, current_state: Tensor, history_summary: Tensor) -> Tensor:
-        history_hidden = self.memory_to_hidden(history_summary)
-        gate = torch.sigmoid(self.gate(torch.cat([current_state, history_hidden], dim=-1)))
-        fused = gate * history_hidden + (1.0 - gate) * current_state
-        return self.norm(fused)
-
-
-class HistoryApplyGate(nn.Module):
-    """Predicts when retrieved history should influence the current step."""
-
-    def __init__(self, hidden_dim: int, bias_init: float):
-        super().__init__()
-        inner_dim = max(hidden_dim // 2, 1)
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, inner_dim),
-            nn.GELU(),
-            nn.Linear(inner_dim, 1),
-        )
-        final_linear = self.net[-1]
-        nn.init.zeros_(final_linear.weight)
-        nn.init.constant_(final_linear.bias, bias_init)
-
-    def forward(self, current_state: Tensor, history_hidden: Tensor) -> Tensor:
-        gate_logits = self.net(torch.cat([current_state, history_hidden], dim=-1))
-        return torch.sigmoid(gate_logits)
-
-
-class CrossTransformerBlock(nn.Module):
-    """MemoryVLA-style retrieval block over token sequences."""
-
-    def __init__(self, feature_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(feature_dim, feature_dim)
-        self.k_proj = nn.Linear(feature_dim, feature_dim)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.attn_norm = nn.LayerNorm(feature_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * 4),
-            nn.GELU(),
-            nn.Linear(feature_dim * 4, feature_dim),
-        )
-        self.ffn_norm = nn.LayerNorm(feature_dim)
-
-    def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        orig_dtype = query.dtype
-        proj_dtype = self.q_proj.weight.dtype
-
-        query_in = query.to(dtype=proj_dtype)
-        key_in = key.to(dtype=proj_dtype)
-        value_in = value.to(dtype=proj_dtype)
-
-        q = self.q_proj(query_in)
-        k = self.k_proj(key_in)
-        v = self.v_proj(value_in)
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        x = self.attn_norm(query_in + attn_out)
-        ffn_out = self.ffn(x)
-        return self.ffn_norm(x + ffn_out).to(dtype=orig_dtype)
-
-
-class SequenceGateFusion(nn.Module):
-    """MemoryVLA-style tokenwise gate fusion."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.proj = nn.Linear(dim * 2, dim)
-        nn.init.normal_(self.proj.weight, mean=0.0, std=1e-3)
-        nn.init.normal_(self.proj.bias, mean=0.0, std=1e-3)
-
-    def forward(self, current_tokens: Tensor, retrieved_tokens: Tensor) -> Tensor:
-        orig_dtype = current_tokens.dtype
-        proj_dtype = self.proj.weight.dtype
-        fused_input = torch.cat([current_tokens, retrieved_tokens], dim=-1).to(dtype=proj_dtype)
-        scale = torch.sigmoid(self.proj(fused_input)).to(dtype=orig_dtype)
-        return scale * current_tokens + (1.0 - scale) * retrieved_tokens
-
-
-class PI05MemoryBank(nn.Module):
-    """MemoryVLA-style episodic bank adapted for pi05 prefix tokens."""
-
-    def __init__(
-        self,
-        token_size: int,
-        mem_length: int,
-        retrieval_layers: int,
-        use_timestep_pe: bool,
-        fusion_type: str,
-        consolidate_type: str,
-        update_fused: bool,
-    ):
-        super().__init__()
-        self.token_size = token_size
-        self.mem_length = mem_length
-        self.retrieval_layers = retrieval_layers
-        self.use_timestep_pe = use_timestep_pe
-        self.fusion_type = fusion_type
-        self.consolidate_type = consolidate_type
-        self.update_fused = update_fused
-
-        self.retrieval_blocks = nn.ModuleList(
-            [CrossTransformerBlock(self.token_size) for _ in range(self.retrieval_layers)]
-        )
-        self.gate_fusion = SequenceGateFusion(self.token_size) if self.fusion_type == "gated" else None
-        self.timestep_encoder = (
-            TimestepEmbedder(self.token_size, frequency_embedding_size=max(self.token_size // 4, 1))
-            if self.use_timestep_pe
-            else None
-        )
-        self.reset()
-
-    def reset(self):
-        self.bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-
-    def clear_episode(self, episode_id: int):
-        self.bank.pop(int(episode_id), None)
-
-    @torch.no_grad()
-    def _consolidate_with_token_merge(self, episode_id: int):
-        bank = self.bank.get(int(episode_id), [])
-        if len(bank) < 2:
-            return
-
-        feats = [feat for _, feat in bank]
-        sims = []
-        for i in range(len(feats) - 1):
-            feat_i = feats[i].reshape(-1, feats[i].shape[-1])
-            feat_j = feats[i + 1].reshape(-1, feats[i + 1].shape[-1])
-            sims.append(F.cosine_similarity(feat_i, feat_j, dim=-1).mean().item())
-
-        idx_max = int(torch.tensor(sims).argmax().item())
-        timestep_i, feat_i = bank[idx_max]
-        _, feat_j = bank[idx_max + 1]
-        fused_feat = 0.5 * (feat_i + feat_j)
-        bank[idx_max] = (timestep_i, fused_feat.detach().clone())
-        bank.pop(idx_max + 1)
-
-    @torch.no_grad()
-    def _memory_consolidate(self, episode_id: int, feat: Tensor, timestep: int | None):
-        episode_key = int(episode_id)
-        if episode_key not in self.bank:
-            self.bank[episode_key] = []
-
-        self.bank[episode_key].append((timestep, feat.detach().clone()))
-        while len(self.bank[episode_key]) > self.mem_length:
-            if self.consolidate_type == "fifo":
-                self.bank[episode_key] = self.bank[episode_key][-self.mem_length :]
-            elif self.consolidate_type == "tome":
-                self._consolidate_with_token_merge(episode_key)
-            else:
-                raise NotImplementedError(f"Unsupported consolidate_type: {self.consolidate_type}")
-
-    def _build_time_pe(self, hist_timesteps: list[int | None], token_count: int, device: torch.device, dtype: torch.dtype):
-        if self.timestep_encoder is None:
-            return None
-
-        valid_timesteps = [0 if t is None else int(t) for t in hist_timesteps]
-        timestep_tensor = torch.tensor(valid_timesteps, device=device, dtype=torch.float32)
-        pe = self.timestep_encoder(timestep_tensor).unsqueeze(0).to(dtype=dtype)
-        return pe.repeat_interleave(token_count, dim=1)
-
-    def _retrieve_from_bank(self, working_mem: Tensor, hist: list[tuple[int | None, Tensor]]) -> Tensor:
-        if len(hist) == 0:
-            return working_mem
-
-        _, token_count, token_dim = working_mem.shape
-        hist_feats = [feat.to(device=working_mem.device, dtype=working_mem.dtype) for _, feat in hist]
-        episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, token_dim).unsqueeze(0)
-        pe = self._build_time_pe([t for t, _ in hist], token_count, working_mem.device, working_mem.dtype)
-        if pe is None:
-            pe = torch.zeros_like(episode_mem)
-
-        query = working_mem
-        for block in self.retrieval_blocks:
-            query = block(query, episode_mem + pe, episode_mem)
-        return query
-
-    def _fuse_tokens(self, working_mem: Tensor, retrieved_mem: Tensor) -> Tensor:
-        if self.fusion_type == "add":
-            return 0.5 * (working_mem + retrieved_mem)
-        return self.gate_fusion(working_mem, retrieved_mem)
-
-    def _process_ordered_tokens(
-        self,
-        tokens: Tensor,
-        episode_ids: list[int],
-        timesteps: list[int | None],
-        bank_override: dict[int, list[tuple[int | None, Tensor]]] | None = None,
-    ) -> Tensor:
-        active_bank = self.bank if bank_override is None else bank_override
-        outputs = []
-        for i in range(tokens.shape[0]):
-            eid = int(episode_ids[i])
-            working_mem = tokens[i].unsqueeze(0)
-            hist = active_bank.get(eid, [])
-            retrieved_mem = self._retrieve_from_bank(working_mem, hist)
-            fused_feats = self._fuse_tokens(working_mem, retrieved_mem)
-            outputs.append(fused_feats)
-
-            timestep_i = timesteps[i] if self.use_timestep_pe else None
-            episode_bank = active_bank.setdefault(eid, [])
-            episode_bank.append(
-                (
-                    timestep_i,
-                    (fused_feats if self.update_fused else working_mem).squeeze(0).detach().clone(),
-                )
-            )
-            while len(episode_bank) > self.mem_length:
-                if self.consolidate_type == "fifo":
-                    del episode_bank[:-self.mem_length]
-                elif self.consolidate_type == "tome":
-                    if bank_override is None:
-                        self._consolidate_with_token_merge(eid)
-                    else:
-                        temp_bank = self.bank
-                        self.bank = active_bank
-                        self._consolidate_with_token_merge(eid)
-                        self.bank = temp_bank
-                else:
-                    raise NotImplementedError(f"Unsupported consolidate_type: {self.consolidate_type}")
-
-        return torch.cat(outputs, dim=0)
-
-    def process_training_batch(
-        self,
-        tokens: Tensor,
-        episode_ids: Tensor | None,
-        timesteps: Tensor | None,
-        training_layout: str,
-    ) -> Tensor:
-        if episode_ids is None:
-            return tokens
-
-        batch_size = tokens.shape[0]
-        episode_list = episode_ids.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        if timesteps is not None:
-            timestep_list = timesteps.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        else:
-            timestep_list = list(range(batch_size))
-
-        if training_layout == "stream":
-            temp_bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-            return self._process_ordered_tokens(tokens, episode_list, timestep_list, bank_override=temp_bank)
-
-        sorted_indices = sorted(
-            range(batch_size),
-            key=lambda idx: (int(episode_list[idx]), int(timestep_list[idx]), idx),
-        )
-        ordered_tokens = tokens[sorted_indices]
-        ordered_episode_ids = [int(episode_list[idx]) for idx in sorted_indices]
-        ordered_timesteps = [int(timestep_list[idx]) for idx in sorted_indices]
-        temp_bank: dict[int, list[tuple[int | None, Tensor]]] = {}
-        ordered_outputs = self._process_ordered_tokens(
-            ordered_tokens,
-            ordered_episode_ids,
-            ordered_timesteps,
-            bank_override=temp_bank,
-        )
-        restored_outputs = torch.empty_like(ordered_outputs)
-        for ordered_idx, original_idx in enumerate(sorted_indices):
-            restored_outputs[original_idx] = ordered_outputs[ordered_idx]
-        return restored_outputs
-
-    def process_runtime_batch(
-        self,
-        tokens: Tensor,
-        episode_ids: list[int],
-        timesteps: list[int | None],
-    ) -> Tensor:
-        return self._process_ordered_tokens(tokens, episode_ids, timesteps)
 
 
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
@@ -696,7 +335,7 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
-    """PaliGemma model with action expert for PI05."""
+    """PaliGemma model with action expert for PI05Word."""
 
     def __init__(
         self,
@@ -908,10 +547,10 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
-    """Core PI05 PyTorch model."""
+class PI05WordPytorch(nn.Module):  # see openpi `PI0Pytorch`
+    """Core PI05Word PyTorch model."""
 
-    def __init__(self, config: PI05MemoryConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: PI05WordConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
@@ -940,44 +579,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # MemoryVLA-style explicit history memory modules.
-        prefix_hidden_dim = paligemma_config.width
-        self.history_mem_bank = PI05MemoryBank(
-            token_size=prefix_hidden_dim,
-            mem_length=config.memory_size,
-            retrieval_layers=config.memory_retrieval_layers,
-            use_timestep_pe=config.use_time_embedding_in_memory,
-            fusion_type=config.memory_fusion,
-            consolidate_type=config.memory_consolidate_type,
-            update_fused=config.memory_update_fused,
-        )
-        # Kept for backward compatibility with older pi05_memory checkpoints.
-        self.history_memory_encoder = HistoryMemoryEncoder(
-            input_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
-        )
-        self.history_retriever = HistoryRetriever(
-            query_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
-            num_heads=config.memory_num_heads,
-            dropout=config.memory_dropout,
-        )
-        self.gated_memory_fusion = GatedMemoryFusion(
-            hidden_dim=prefix_hidden_dim,
-            memory_dim=config.memory_dim,
-        )
-
-        history_module_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
-        self.history_mem_bank.to(dtype=history_module_dtype)
-        self.history_memory_encoder.to(dtype=history_module_dtype)
-        self.history_retriever.to(dtype=history_module_dtype)
-        self.gated_memory_fusion.to(dtype=history_module_dtype)
-
-        # A global residual scale keeps the model close to vanilla pi05 at init
-        # and lets history influence grow only when the optimization supports it.
-        self.history_residual_scale = nn.Parameter(torch.tensor(config.memory_residual_scale_init, dtype=torch.float32))
-        self.reset_history_memory()
-
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -994,7 +595,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-        logging.info("Enabled gradient checkpointing for PI05Pytorch model")
+        logging.info("Enabled gradient checkpointing for PI05WordPytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
@@ -1002,259 +603,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-        logging.info("Disabled gradient checkpointing for PI05Pytorch model")
-
-    def reset_history_memory(self):
-        """Reset the explicit history memory used during training and online inference."""
-        self.runtime_episode_id = None
-        self.runtime_frame_index = 0
-        self.runtime_memory_tokens = []
-        self.training_history_cache = {}
-        self.history_mem_bank.reset()
-
-    def _update_training_history_cache(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> None:
-        # Legacy helper retained for backward compatibility. The active training
-        # path now routes through `self.history_mem_bank`.
-        return
-
-    def _get_runtime_history(self, batch_size: int, device: torch.device) -> tuple[Tensor | None, Tensor | None]:
-        # Legacy helper retained for backward compatibility. The active inference
-        # path now routes through `self.history_mem_bank`.
-        history_tokens = None
-        memory_mask = None
-        return history_tokens, memory_mask
-
-    def _update_runtime_history(self, current_memory_token: Tensor):
-        # Legacy helper retained for backward compatibility. Runtime updates now
-        # happen inside `self.history_mem_bank.process_runtime_batch`.
-        return
-
-    def _summarize_hidden_states(self, hidden_states: Tensor, pad_masks: Tensor) -> Tensor:
-        weights = pad_masks.to(dtype=hidden_states.dtype).unsqueeze(-1)
-        denom = weights.sum(dim=1).clamp_min(1.0)
-        return (hidden_states * weights).sum(dim=1) / denom
-
-    def _build_training_history_from_batch(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Legacy interface retained while migration moves to MemoryVLA-style banks."""
-        return None, None
-
-    def _build_training_history_from_batch_fifo(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Simulate the inference-time FIFO using only the current batch.
-
-        This avoids mixing in stale memory tokens produced by older model weights,
-        which happens when a cache survives parameter updates across many batches.
-        """
-        if episode_indices is None or frame_indices is None:
-            return None, None
-
-        batch_size, memory_dim = current_memory_tokens.shape
-        if batch_size == 0:
-            return None, None
-
-        episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        frame_ids = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-
-        history_tokens = torch.zeros(
-            batch_size,
-            self.config.memory_size,
-            memory_dim,
-            device=current_memory_tokens.device,
-            dtype=current_memory_tokens.dtype,
-        )
-        history_mask = torch.ones(
-            batch_size,
-            self.config.memory_size,
-            device=current_memory_tokens.device,
-            dtype=torch.bool,
-        )
-
-        source_tokens = current_memory_tokens.detach()
-        episode_to_frame_rows: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
-        for row_idx, (episode_id, frame_id) in enumerate(zip(episode_ids, frame_ids, strict=True)):
-            episode_to_frame_rows[int(episode_id)][int(frame_id)].append(row_idx)
-
-        for frame_rows in episode_to_frame_rows.values():
-            fifo_tokens: deque[Tensor] = deque(maxlen=self.config.memory_size)
-            for _, row_indices in sorted(frame_rows.items()):
-                if fifo_tokens:
-                    selected_tokens = torch.stack(list(fifo_tokens), dim=0)
-                    selected_tokens = selected_tokens.to(
-                        device=current_memory_tokens.device,
-                        dtype=current_memory_tokens.dtype,
-                    )
-                    history_len = selected_tokens.shape[0]
-                    for row_idx in row_indices:
-                        history_tokens[row_idx, :history_len] = selected_tokens
-                        history_mask[row_idx, :history_len] = False
-
-                frame_token = source_tokens[row_indices].mean(dim=0)
-                fifo_tokens.append(frame_token)
-
-        return history_tokens, history_mask
-
-    def _build_training_history_from_cache(
-        self,
-        current_memory_tokens: Tensor,
-        episode_indices: Tensor | None,
-        frame_indices: Tensor | None,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Legacy history builder kept for ablations and backward comparison."""
-        if episode_indices is None or frame_indices is None:
-            return None, None
-
-        batch_size, memory_dim = current_memory_tokens.shape
-        if batch_size == 0:
-            return None, None
-
-        episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-        frame_ids = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-
-        history_tokens = torch.zeros(
-            batch_size,
-            self.config.memory_size,
-            memory_dim,
-            device=current_memory_tokens.device,
-            dtype=current_memory_tokens.dtype,
-        )
-        history_mask = torch.ones(
-            batch_size,
-            self.config.memory_size,
-            device=current_memory_tokens.device,
-            dtype=torch.bool,
-        )
-
-        source_tokens = current_memory_tokens.detach()
-        for i in range(batch_size):
-            episode_key = int(episode_ids[i])
-            frame_key = int(frame_ids[i])
-            candidate_tokens_by_frame: dict[int, Tensor] = {}
-
-            for cached_frame, cached_token in self.training_history_cache.get(episode_key, []):
-                if cached_frame < frame_key:
-                    candidate_tokens_by_frame[int(cached_frame)] = cached_token.to(
-                        device=current_memory_tokens.device,
-                        dtype=current_memory_tokens.dtype,
-                    )
-
-            for j in range(batch_size):
-                if j == i:
-                    continue
-                if int(episode_ids[j]) != episode_key or int(frame_ids[j]) >= frame_key:
-                    continue
-                candidate_tokens_by_frame[int(frame_ids[j])] = source_tokens[j]
-
-            if not candidate_tokens_by_frame:
-                continue
-
-            selected_frames = sorted(candidate_tokens_by_frame)[-self.config.memory_size :]
-            selected_tokens = torch.stack([candidate_tokens_by_frame[f] for f in selected_frames], dim=0)
-            history_len = selected_tokens.shape[0]
-            history_tokens[i, :history_len] = selected_tokens
-            history_mask[i, :history_len] = False
-
-        self._update_training_history_cache(current_memory_tokens, episode_indices, frame_indices)
-        return history_tokens, history_mask
-
-    def _compute_prefix_hidden_states(
-        self,
-        prefix_embs: Tensor,
-        prefix_pad_masks: Tensor,
-        prefix_att_masks: Tensor,
-    ) -> Tensor:
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-
-        attn_dtype = self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
-        prefix_att_2d_masks_4d = prefix_att_2d_masks_4d.to(dtype=attn_dtype)
-        prefix_embs = prefix_embs.to(dtype=attn_dtype)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        def prefix_forward_func(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids):
-            (prefix_out, _), _ = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=False,
-            )
-            return prefix_out
-
-        return self._apply_checkpoint(
-            prefix_forward_func,
-            prefix_embs,
-            prefix_att_2d_masks_4d,
-            prefix_position_ids,
-        )
-
-    def _augment_prefix_with_history(
-        self,
-        prefix_embs: Tensor,
-        prefix_pad_masks: Tensor,
-        prefix_att_masks: Tensor,
-        history_tokens: Tensor | None = None,
-        memory_mask: Tensor | None = None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
-        if not self.config.use_history_memory:
-            return prefix_embs, None, None, None
-
-        prefix_hidden_states = self._compute_prefix_hidden_states(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-        )
-        if self.training:
-            fused_prefix_hidden_states = self.history_mem_bank.process_training_batch(
-                prefix_hidden_states,
-                episode_ids=episode_indices,
-                timesteps=frame_indices,
-                training_layout=self.config.memory_training_layout,
-            )
-        else:
-            batch_size = prefix_hidden_states.shape[0]
-            if episode_indices is not None:
-                runtime_episode_ids = episode_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-            elif self.runtime_episode_id is not None:
-                runtime_episode_ids = [int(self.runtime_episode_id)] * batch_size
-            else:
-                runtime_episode_ids = list(range(batch_size))
-
-            if frame_indices is not None:
-                runtime_timesteps = frame_indices.reshape(batch_size, -1)[:, 0].detach().cpu().tolist()
-                if batch_size > 0:
-                    self.runtime_frame_index = int(max(runtime_timesteps)) + 1
-            else:
-                runtime_timesteps = list(range(self.runtime_frame_index, self.runtime_frame_index + batch_size))
-                self.runtime_frame_index += batch_size
-
-            fused_prefix_hidden_states = self.history_mem_bank.process_runtime_batch(
-                prefix_hidden_states,
-                episode_ids=runtime_episode_ids,
-                timesteps=runtime_timesteps,
-            )
-
-        residual_scale = torch.tanh(self.history_residual_scale).to(dtype=prefix_hidden_states.dtype)
-        prefix_delta = (residual_scale * (fused_prefix_hidden_states - prefix_hidden_states)).to(dtype=prefix_embs.dtype)
-        prefix_embs = prefix_embs + prefix_delta
-
-        return prefix_embs, None, None, None
+        logging.info("Disabled gradient checkpointing for PI05WordPytorch model")
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
@@ -1378,18 +727,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(
-        self,
-        images,
-        img_masks,
-        tokens,
-        masks,
-        actions,
-        noise=None,
-        time=None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
-    ) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -1402,13 +740,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_embs, _, _, _ = self._augment_prefix_with_history(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -1460,8 +791,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
-        episode_indices: Tensor | None = None,
-        frame_indices: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -1481,13 +810,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_embs, _, _, _ = self._augment_prefix_with_history(
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -1580,15 +902,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return self.action_out_proj(suffix_out)
 
 
-class PI05MemoryPolicy(PreTrainedPolicy):
-    """PI05 Policy for LeRobot."""
+class PI05WordPolicy(PreTrainedPolicy):
+    """PI05Word policy for LeRobot."""
 
-    config_class = PI05MemoryConfig
-    name = "pi05_memory"
+    config_class = PI05WordConfig
+    name = "pi05_word"
 
     def __init__(
         self,
-        config: PI05MemoryConfig,
+        config: PI05WordConfig,
         **kwargs,
     ):
         """
@@ -1599,9 +921,9 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize the core PI05 model
+        # Initialize the core PI05Word model
         self.init_rtc_processor()
-        self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+        self.model = PI05WordPytorch(config, rtc_processor=self.rtc_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1624,12 +946,12 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
         revision: str | None = None,
-        strict: bool = False,
+        strict: bool = True,
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
         print(
-            "The PI05 model is a direct port of the OpenPI implementation. \n"
+            "The PI05Word model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
             "Original implementation: https://github.com/Physical-Intelligence/openpi"
         )
@@ -1674,7 +996,7 @@ class PI05MemoryPolicy(PreTrainedPolicy):
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
-                print("Loaded state dict from model.safetensors")
+                print("鉁?Loaded state dict from model.safetensors")
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
@@ -1763,15 +1085,15 @@ class PI05MemoryPolicy(PreTrainedPolicy):
                     logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
                     continue
 
-            # Handle MLP naming changes for pi05_memory
-            # pi05_memory model expects time_mlp_*, but checkpoint might have action_time_mlp_*
+            # Handle MLP naming changes for pi05_word.
+            # pi05_word model expects time_mlp_*, but checkpoint might have action_time_mlp_*.
             if key.startswith("action_time_mlp_in."):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05_memory
+            # Also handle state_proj which shouldn't exist in pi05_word.
             if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05_memory mode: {key}")
+                logging.warning(f"Skipping state_proj key in pi05_word mode: {key}")
                 continue
 
             # Handle vision tower embedding layer potential differences
@@ -1800,8 +1122,6 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.reset_memory_on_new_episode and hasattr(self.model, "reset_history_memory"):
-            self.model.reset_history_memory()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1912,35 +1232,12 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        episode_indices = batch.get("episode_index")
-        if episode_indices is not None and hasattr(self.model, "runtime_episode_id"):
-            episode_indices = episode_indices.reshape(episode_indices.shape[0], -1)[:, 0]
-            if episode_indices.numel() > 0 and torch.all(episode_indices == episode_indices[0]):
-                current_episode_id = int(episode_indices[0].item())
-                previous_episode_id = self.model.runtime_episode_id
-                if (
-                    self.config.reset_memory_on_new_episode
-                    and previous_episode_id is not None
-                    and current_episode_id != previous_episode_id
-                ):
-                    self.model.reset_history_memory()
-                self.model.runtime_episode_id = current_episode_id
-
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        frame_indices = batch.get("frame_index")
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(
-            images,
-            img_masks,
-            tokens,
-            masks,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-            **kwargs,
-        )
+        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05Word).
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1962,19 +1259,9 @@ class PI05MemoryPolicy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
-        episode_indices = batch.get("episode_index")
-        frame_indices = batch.get("frame_index")
 
-        # Compute loss with a simple batch-internal history window when episode/frame indices are available.
-        losses = self.model.forward(
-            images,
-            img_masks,
-            tokens,
-            masks,
-            actions,
-            episode_indices=episode_indices,
-            frame_indices=frame_indices,
-        )
+        # Compute loss (no separate state needed for PI05Word).
+        losses = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -2005,3 +1292,5 @@ class PI05MemoryPolicy(PreTrainedPolicy):
             "target_modules": target_modules,
             "modules_to_save": [],
         }
+
+
