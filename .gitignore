@@ -182,6 +182,7 @@ outputs/
 # Large training / eval artifacts
 checkpoints/
 eval_logs/
+eval_outputs/
 lerobot_outputs/
 cache_hf_preload/
 cache_huggingface/
@@ -200,6 +201,7 @@ src/lerobot/policies/pi0_residual_every_step_backup_20260317_161353/
 # Symlinked artifact entrypoints
 checkpoints
 eval_logs
+eval_outputs
 lerobot_outputs
 logs
 outputs
